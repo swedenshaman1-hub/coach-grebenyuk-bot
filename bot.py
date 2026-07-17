@@ -32,8 +32,8 @@ _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 if _nb_auth_json and _nb_data_dir:
     import httpx as _httpx
-    os.makedirs(_nb_data_dir, exist_ok=True)
-    _auth_path = os.path.join(_nb_data_dir, "auth.json")
+    import time as _time
+    from notebooklm_mcp_2026.auth import AuthTokens as _AuthTokens, save_tokens as _save_tokens
     _auth_data = json.loads(_nb_auth_json)
     # Пробуем получить свежий CSRF с NotebookLM до запуска клиента.
     # GenerateFreeFormStreamed строго валидирует CSRF, а batchexecute — нет.
@@ -62,8 +62,14 @@ if _nb_auth_json and _nb_data_dir:
             print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
     except Exception as _e:
         print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
-    with open(_auth_path, "w", encoding="utf-8") as _f:
-        json.dump(_auth_data, _f)
+    # Сохраняем через библиотечный save_tokens — гарантирует правильный формат для load_tokens()
+    _save_tokens(_AuthTokens(
+        cookies=_auth_data.get("cookies", {}),
+        csrf_token=_auth_data.get("csrf_token", ""),
+        session_id=_auth_data.get("session_id", ""),
+        extracted_at=_auth_data.get("extracted_at", _time.time()),
+    ))
+    print("auth.json сохранён через save_tokens()", flush=True)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
