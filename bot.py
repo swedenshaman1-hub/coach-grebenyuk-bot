@@ -263,8 +263,9 @@ _TTS_CHUNK_LIMIT = 4000
 def _tts_chunk(text: str) -> str:
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=300_000),
+        http_options=genai_types.HttpOptions(timeout=90_000),
     )
+    response = None
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -283,9 +284,12 @@ def _tts_chunk(text: str) -> str:
             )
             break
         except Exception as e:
-            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout")) and attempt < 2:
+            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout", "503", "UNAVAILABLE")) and attempt < 2:
+                time.sleep(5)
                 continue
             raise
+    if response is None:
+        raise RuntimeError("TTS: все попытки исчерпаны")
 
     pcm_data = response.candidates[0].content.parts[0].inline_data.data
     fd, path = tempfile.mkstemp(suffix=".wav")
@@ -369,8 +373,9 @@ async def _answer(update: Update, question: str):
         for path in audio_paths:
             with open(path, "rb") as f:
                 await update.message.reply_voice(f)
-    except Exception:
+    except Exception as e:
         logger.exception("TTS error")
+        await update.message.reply_text(f"Голос не удалось сгенерировать: {e}")
     finally:
         for path in audio_paths:
             try:
