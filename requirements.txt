@@ -1,5 +1,4 @@
-python-telegram-bot==21.6
-python-dotenv==1.0.1
-groq>=0.13.0
-httpx>=0.28.1,<1.0.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+python-telegram-bot>=20.0
 notebooklm-mcp-2026>=0.2.1
