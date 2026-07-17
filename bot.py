@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
+import re
 import sys
 import tempfile
 import time
@@ -28,14 +28,42 @@ from telegram.ext import (
 load_dotenv()
 
 # На Railway: восстанавливаем auth.json из переменной окружения
+# и сразу обновляем CSRF-токен с текущего IP сервера
 _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 if _nb_auth_json and _nb_data_dir:
+    import httpx as _httpx
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
-    if not os.path.exists(_auth_path):
-        with open(_auth_path, "w", encoding="utf-8") as _f:
-            _f.write(_nb_auth_json)
+    _auth_data = json.loads(_nb_auth_json)
+    # Получаем свежий CSRF прямо с текущего IP (Railway или локального)
+    try:
+        _jar = _httpx.Cookies()
+        for _k, _v in _auth_data.get("cookies", {}).items():
+            _jar.set(_k, _v, domain=".google.com")
+        _hdrs = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
+            _pg = _hc.get("https://notebooklm.google.com/")
+        if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
+            _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
+            if _m:
+                _auth_data["csrf_token"] = _m.group(1)
+                _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
+                if _m2:
+                    _auth_data["session_id"] = _m2.group(1)
+                print(f"Startup CSRF OK: {_auth_data['csrf_token'][:35]}...", flush=True)
+            else:
+                print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
+        else:
+            print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
+    except Exception as _e:
+        print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
+    with open(_auth_path, "w", encoding="utf-8") as _f:
+        json.dump(_auth_data, _f)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -49,16 +77,16 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 NOTEBOOK_ID = "85da7d6e-6980-4da0-89a9-4efabc9542bc"
 
-# Python с установленным notebooklm_mcp_2026
-_WIN_MCP_PYTHON = r"C:\Users\Admin\AppData\Roaming\uv\tools\notebooklm-mcp-2026\Scripts\python.exe"
-MCP_PYTHON = _WIN_MCP_PYTHON if os.path.exists(_WIN_MCP_PYTHON) else sys.executable
-
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
 HISTORY_LIMIT = 6
 
 # conversation_id для продолжения диалога в NotebookLM
 _nb_conversations: dict[int, str] = {}
+
+# Локальный прокси (опционально): Railway-бот → локальная машина → NotebookLM
+_NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
+_NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
 
@@ -77,7 +105,7 @@ COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко
 Твоя роль: обучать системному построению бизнеса, отделов продаж и масштабированию прибыли на основе авторских материалов Гребенюка. Отвечать чётко, конкретно и по делу — как опытный бизнес-наставник, без воды. Использовать термины методологии естественно. Давать практические инструменты и конкретные шаги. При необходимости задавать уточняющие вопросы.
 
 Формат ответа — ОБЯЗАТЕЛЬНО:
-Пиши сплошным живым текстом, как говоришь вслух. Никаких звёздочек, никаких дефисов в начале строк, никаких тире как маркеров списка, никакого markdown вообще. Только обычные слова и предложения. Абзацы разделяй пустой строкой. Завершай ответ коротким вопросом или конкретным заданием на сегодня."""
+Пиши сплошным живым текстом, как говоришь вслух. Никаких звёздочек, никаких дефисов в начале строк, никаких тире как маркеров списка, никакого markdown вообще. Только обычные слова и предложения. Абзацы разделяй пустой строкой. Длина ответа — не более 400 слов. Завершай ответ коротким вопросом или конкретным заданием на сегодня."""
 
 
 def _build_notebooklm_query(question: str, history: list[dict]) -> str:
@@ -93,6 +121,19 @@ def _build_notebooklm_query(question: str, history: list[dict]) -> str:
         f"Вопрос по методологии Гребенюка «Ноль справа»:\n{question}\n\n"
         "Дай развёрнутый ответ, опираясь на материалы методологии."
     )
+
+
+def _strip_markdown(text: str) -> str:
+    text = re.sub(r'\s*\[\d+(?:[,\-\s]\s*\d+)*\]', '', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    text = re.sub(r'^\s*[\*\-•]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
@@ -118,56 +159,73 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
     return response.text.strip()
 
 
-# ─── NotebookLM через MCP ─────────────────────────────────────────────────────
+# ─── NotebookLM ──────────────────────────────────────────────────────────────
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    conv_id = _nb_conversations.get(chat_id)
-    # csrf_token='' forces _refresh_auth_tokens() to fetch a fresh CSRF from the
-    # current server IP — without this, the saved CSRF (from local machine) causes
-    # 401 Unauthorized when Railway's IP makes the API request.
-    script = (
-        "import sys, json\n"
-        "sys.stdout.reconfigure(encoding='utf-8')\n"
-        "from notebooklm_mcp_2026.auth import load_tokens\n"
-        "from notebooklm_mcp_2026.client import NotebookLMClient, AuthenticationError\n"
-        "try:\n"
-        "    tokens = load_tokens()\n"
-        "    if tokens is None:\n"
-        "        print(json.dumps({'status': 'error', 'error': 'Not authenticated'}))\n"
-        "    else:\n"
-        "        client = NotebookLMClient(cookies=tokens.cookies, csrf_token='', session_id=tokens.session_id)\n"
-        f"        r = client.query(notebook_id={NOTEBOOK_ID!r}, query_text={query!r}"
-        + (f", conversation_id={conv_id!r}" if conv_id else "")
-        + ")\n"
-        "        print(json.dumps({'status': 'success', **r}, ensure_ascii=False))\n"
-        "except AuthenticationError as e:\n"
-        "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
-        "except Exception as e:\n"
-        "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
-    )
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    try:
-        result = subprocess.run(
-            [MCP_PYTHON, "-c", script],
-            capture_output=True, text=True, encoding="utf-8", timeout=120, env=env,
-        )
-        if result.returncode != 0:
-            logger.error(f"NotebookLM error: {result.stderr[:500]}")
+    logger.info(f"NotebookLM query: {query[:80]}")
+
+    if _NB_LOCAL_URL:
+        # Прокси-режим: запрос уходит на локальный сервер пользователя
+        try:
+            import urllib.request
+            payload = json.dumps({"query": query, "chat_id": chat_id}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{_NB_LOCAL_URL}/ask",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Secret": _NB_LOCAL_SECRET,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok"):
+                answer = data.get("answer", "").strip()
+                logger.info(f"NotebookLM proxy: {len(answer)} символов")
+                return answer or None
+            else:
+                logger.error(f"NotebookLM proxy error: {data.get('error')}")
+                return None
+        except Exception as e:
+            logger.exception(f"NotebookLM proxy exception: {e}")
             return None
-        data = json.loads(result.stdout.strip())
-        if data.get("status") == "success":
-            new_conv = data.get("conversation_id")
-            if new_conv:
-                _nb_conversations[chat_id] = new_conv
-            return data.get("answer", "").strip() or None
-        logger.error(f"NotebookLM returned error: {data.get('error')}")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("NotebookLM timeout")
-    except Exception as e:
-        logger.exception(f"NotebookLM error: {e}")
+
+    # Прямой режим: импорт notebooklm_mcp_2026 с 401-retry
+    conv_id = _nb_conversations.get(chat_id)
+    from notebooklm_mcp_2026.tools.query import query_notebook
+    from notebooklm_mcp_2026 import server as _nb_server
+
+    for _attempt in range(2):
+        try:
+            result = query_notebook(
+                notebook_id=NOTEBOOK_ID,
+                query=query,
+                conversation_id=conv_id or None,
+            )
+            logger.info(f"NotebookLM status: {result.get('status')} | attempt={_attempt}")
+            if result.get("status") == "success":
+                new_conv = result.get("conversation_id")
+                if new_conv:
+                    _nb_conversations[chat_id] = new_conv
+                return result.get("answer", "").strip() or None
+
+            error = result.get("error", "")
+            if "401" in str(error) and _attempt == 0:
+                logger.info("NotebookLM 401, refreshing CSRF and retrying...")
+                try:
+                    _client = _nb_server.get_client()
+                    _client._refresh_auth_tokens()
+                except Exception as _re:
+                    logger.warning(f"CSRF refresh failed: {_re}")
+                    _nb_server.reset_client()
+                continue
+
+            logger.error(f"NotebookLM error: {error} | hint: {result.get('hint', '')}")
+            return None
+        except Exception as e:
+            logger.exception(f"NotebookLM exception: {e}")
+            return None
     return None
 
 
@@ -199,8 +257,10 @@ def _transcribe(file_path: str) -> str:
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
 
-def _text_to_speech(text: str) -> str:
-    tts_text = text[:2500].rsplit(".", 1)[0] + "." if len(text) > 2500 else text
+_TTS_CHUNK_LIMIT = 4000
+
+
+def _tts_chunk(text: str) -> str:
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=300_000),
@@ -209,7 +269,7 @@ def _text_to_speech(text: str) -> str:
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-tts",
-                contents=tts_text,
+                contents=text,
                 config=genai_types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=genai_types.SpeechConfig(
@@ -236,6 +296,28 @@ def _text_to_speech(text: str) -> str:
         wf.setframerate(24000)
         wf.writeframes(pcm_data)
     return path
+
+
+def _split_for_tts(text: str) -> list[str]:
+    if len(text) <= _TTS_CHUNK_LIMIT:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > _TTS_CHUNK_LIMIT:
+        cut = remaining[:_TTS_CHUNK_LIMIT]
+        last_dot = cut.rfind(".")
+        if last_dot > _TTS_CHUNK_LIMIT // 2:
+            cut = cut[:last_dot + 1]
+        chunks.append(cut.strip())
+        remaining = remaining[len(cut):].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _text_to_speech(text: str) -> list[str]:
+    parts = _split_for_tts(text)
+    return [_tts_chunk(p) for p in parts]
 
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
@@ -271,6 +353,7 @@ async def _answer(update: Update, question: str):
     except Exception:
         logger.exception("Gemini reformat error")
         answer = raw
+    answer = _strip_markdown(answer)
 
     history.append({"role": "user", "text": question})
     history.append({"role": "assistant", "text": answer[:500]})
@@ -279,18 +362,19 @@ async def _answer(update: Update, question: str):
 
     await _send_long(update, answer)
 
-    audio_path = None
+    audio_paths: list[str] = []
     try:
         await update.message.reply_text("Озвучиваю... 🎙")
-        audio_path = await _run_blocking(_text_to_speech, answer)
-        with open(audio_path, "rb") as f:
-            await update.message.reply_voice(f)
+        audio_paths = await _run_blocking(_text_to_speech, answer)
+        for path in audio_paths:
+            with open(path, "rb") as f:
+                await update.message.reply_voice(f)
     except Exception:
         logger.exception("TTS error")
     finally:
-        if audio_path:
+        for path in audio_paths:
             try:
-                os.unlink(audio_path)
+                os.unlink(path)
             except Exception:
                 pass
 
@@ -309,7 +393,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "— KPI, скрипты и мотивация команды\n"
         "— Декомпозиция целей и масштабирование прибыли\n\n"
         "/reset — начать диалог заново\n"
-        "/id — узнать свой Telegram ID"
+        "/id — узнать свой Telegram ID\n"
+        "/debug — диагностика подключения"
     )
 
 
@@ -324,6 +409,55 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Твой Telegram chat_id: `{update.effective_chat.id}`", parse_mode="Markdown"
     )
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = []
+    auth_json_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip())
+    data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+    lines.append(f"NOTEBOOKLM_AUTH_JSON задан: {auth_json_set}")
+    lines.append(f"NOTEBOOKLM_MCP_DATA_DIR: {data_dir or '(не задан)'}")
+    lines.append(f"NOTEBOOKLM_LOCAL_URL: {_NB_LOCAL_URL or '(не задан, прямой режим)'}")
+
+    if data_dir:
+        auth_path = os.path.join(data_dir, "auth.json")
+        exists = os.path.exists(auth_path)
+        lines.append(f"auth.json существует: {exists}")
+        if exists:
+            try:
+                with open(auth_path) as f:
+                    data = json.load(f)
+                cookies = data.get("cookies", {})
+                csrf = data.get("csrf_token", "")
+                lines.append(f"Кук: {list(cookies.keys())[:4]}...")
+                lines.append(f"CSRF: {csrf[:40]}..." if csrf else "CSRF: (пусто)")
+            except Exception as e:
+                lines.append(f"Ошибка чтения auth.json: {e}")
+
+    lines.append("\nЗапрашиваю NotebookLM (тест)...")
+    await update.message.reply_text("\n".join(lines))
+    lines = []
+
+    try:
+        from notebooklm_mcp_2026.tools.query import query_notebook
+        result = query_notebook(notebook_id=NOTEBOOK_ID, query="Что такое «Ноль справа»?")
+        status = result.get("status")
+        error = result.get("error", "")
+        hint = result.get("hint", "")
+        answer = result.get("answer", "")
+        lines.append(f"Статус: {status}")
+        if error:
+            lines.append(f"Ошибка: {error}")
+        if hint:
+            lines.append(f"Подсказка: {hint}")
+        if answer:
+            lines.append(f"Ответ (200 симв.):\n{answer[:200]}")
+    except Exception as e:
+        import traceback
+        lines.append(f"Исключение: {e}")
+        lines.append(traceback.format_exc()[-800:])
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,7 +497,9 @@ def main():
         print("GEMINI_API_KEY не задан в .env")
         sys.exit(1)
 
-    print(f"Coach Grebenyuk запускается... MCP_PYTHON={MCP_PYTHON}")
+    mode = f"прокси → {_NB_LOCAL_URL}" if _NB_LOCAL_URL else "прямой импорт"
+    print(f"Coach Grebenyuk запускается... NotebookLM: {mode}")
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -373,6 +509,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
