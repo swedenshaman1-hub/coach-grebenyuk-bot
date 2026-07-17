@@ -27,19 +27,43 @@ from telegram.ext import (
 
 load_dotenv()
 
-# На Railway: восстанавливаем auth.json из переменной окружения.
-# Сбрасываем csrf_token в "" — библиотека сама вызовет _refresh_auth_tokens()
-# при первом get_client() и получит свежий CSRF с текущего IP сервера.
+# На Railway: восстанавливаем auth.json из переменной окружения
 _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 if _nb_auth_json and _nb_data_dir:
+    import httpx as _httpx
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
     _auth_data = json.loads(_nb_auth_json)
-    _auth_data["csrf_token"] = ""  # принудительный авто-рефреш через библиотеку
+    # Пробуем получить свежий CSRF с NotebookLM до запуска клиента.
+    # GenerateFreeFormStreamed строго валидирует CSRF, а batchexecute — нет.
+    try:
+        _jar = _httpx.Cookies()
+        for _k, _v in _auth_data.get("cookies", {}).items():
+            _jar.set(_k, _v, domain=".google.com")
+        _hdrs = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
+            _pg = _hc.get("https://notebooklm.google.com/")
+        if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
+            _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
+            if _m:
+                _auth_data["csrf_token"] = _m.group(1)
+                _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
+                if _m2:
+                    _auth_data["session_id"] = _m2.group(1)
+                print(f"Startup CSRF OK: {_auth_data['csrf_token'][:35]}...", flush=True)
+            else:
+                print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
+        else:
+            print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
+    except Exception as _e:
+        print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
     with open(_auth_path, "w", encoding="utf-8") as _f:
         json.dump(_auth_data, _f)
-    print("auth.json записан, csrf_token сброшен — будет авто-рефреш", flush=True)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -187,25 +211,14 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
                 return result.get("answer", "").strip() or None
 
             error = result.get("error", "")
-            logger.warning(f"NotebookLM attempt {_attempt}: {str(error)[:200]}")
-            needs_retry = _attempt == 0 and any(
-                x in str(error) for x in ("401", "403", "Authentication", "CSRF", "cookie", "expired")
-            )
-            if needs_retry:
-                logger.info("NotebookLM auth error, resetting CSRF and retrying...")
+            if "401" in str(error) and _attempt == 0:
+                logger.info("NotebookLM 401, refreshing CSRF and retrying...")
                 try:
-                    # Сбрасываем csrf в auth.json → следующий get_client() авто-обновит
-                    from notebooklm_mcp_2026.auth import load_tokens, save_tokens, AuthTokens
-                    import time as _time
-                    _tok = load_tokens()
-                    if _tok:
-                        save_tokens(AuthTokens(
-                            cookies=_tok.cookies, csrf_token="",
-                            session_id=_tok.session_id, extracted_at=_time.time(),
-                        ))
-                    _nb_server.reset_client()
+                    _client = _nb_server.get_client()
+                    _client._refresh_auth_tokens()
                 except Exception as _re:
-                    logger.warning(f"CSRF reset failed: {_re}")
+                    logger.warning(f"CSRF refresh failed: {_re}")
+                    _nb_server.reset_client()
                 continue
 
             logger.error(f"NotebookLM error: {error} | hint: {result.get('hint', '')}")
