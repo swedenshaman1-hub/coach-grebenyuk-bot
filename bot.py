@@ -122,14 +122,28 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     conv_id = _nb_conversations.get(chat_id)
+    # csrf_token='' forces _refresh_auth_tokens() to fetch a fresh CSRF from the
+    # current server IP — without this, the saved CSRF (from local machine) causes
+    # 401 Unauthorized when Railway's IP makes the API request.
     script = (
         "import sys, json\n"
         "sys.stdout.reconfigure(encoding='utf-8')\n"
-        "from notebooklm_mcp_2026.tools.query import query_notebook\n"
-        f"r = query_notebook({NOTEBOOK_ID!r}, {query!r}"
+        "from notebooklm_mcp_2026.auth import load_tokens\n"
+        "from notebooklm_mcp_2026.client import NotebookLMClient, AuthenticationError\n"
+        "try:\n"
+        "    tokens = load_tokens()\n"
+        "    if tokens is None:\n"
+        "        print(json.dumps({'status': 'error', 'error': 'Not authenticated'}))\n"
+        "    else:\n"
+        "        client = NotebookLMClient(cookies=tokens.cookies, csrf_token='', session_id=tokens.session_id)\n"
+        f"        r = client.query(notebook_id={NOTEBOOK_ID!r}, query_text={query!r}"
         + (f", conversation_id={conv_id!r}" if conv_id else "")
         + ")\n"
-        "print(json.dumps(r, ensure_ascii=False))\n"
+        "        print(json.dumps({'status': 'success', **r}, ensure_ascii=False))\n"
+        "except AuthenticationError as e:\n"
+        "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
