@@ -272,13 +272,13 @@ def _transcribe(file_path: str) -> str:
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
 
-_TTS_CHUNK_LIMIT = 4000
+_TTS_CHUNK_LIMIT = 1500
 
 
 def _tts_chunk(text: str) -> str:
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=90_000),
+        http_options=genai_types.HttpOptions(timeout=120_000),
     )
     response = None
     for attempt in range(3):
@@ -299,8 +299,9 @@ def _tts_chunk(text: str) -> str:
             )
             break
         except Exception as e:
-            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout", "503", "UNAVAILABLE")) and attempt < 2:
-                time.sleep(5)
+            err_str = str(e).lower()
+            if any(x in err_str for x in ("deadline", "504", "timeout", "timed", "503", "unavailable")) and attempt < 2:
+                time.sleep(8 * (attempt + 1))
                 continue
             raise
     if response is None:
@@ -389,8 +390,7 @@ async def _answer(update: Update, question: str):
             with open(path, "rb") as f:
                 await update.message.reply_voice(f)
     except Exception as e:
-        logger.exception("TTS error")
-        await update.message.reply_text(f"Голос не удалось сгенерировать: {e}")
+        logger.warning(f"TTS failed (text already sent): {e}")
     finally:
         for path in audio_paths:
             try:
