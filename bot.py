@@ -382,15 +382,25 @@ async def _answer(update: Update, question: str):
 
     await _send_long(update, answer)
 
+    # Для голоса берём первые 600 символов — быстрая генерация, текст уже доставлен
+    voice_text = answer[:600]
+    dot = voice_text.rfind(".")
+    if dot > 200:
+        voice_text = voice_text[:dot + 1].strip()
+
     audio_paths: list[str] = []
     try:
-        await update.message.reply_text("Озвучиваю... 🎙")
-        audio_paths = await _run_blocking(_text_to_speech, answer)
+        audio_paths = await asyncio.wait_for(
+            _run_blocking(_text_to_speech, voice_text),
+            timeout=50.0,
+        )
         for path in audio_paths:
             with open(path, "rb") as f:
                 await update.message.reply_voice(f)
+    except asyncio.TimeoutError:
+        logger.warning("TTS timeout, skipping voice")
     except Exception as e:
-        logger.warning(f"TTS failed (text already sent): {e}")
+        logger.warning(f"TTS failed: {e}")
     finally:
         for path in audio_paths:
             try:
