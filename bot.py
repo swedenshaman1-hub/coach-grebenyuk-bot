@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import wave
 from collections import defaultdict
@@ -36,6 +37,8 @@ _NB_AUTH_DATA: dict = {}  # хранится в памяти для перепо
 
 if (_nb_auth_json or _nb_auth_json_b64) and _nb_data_dir:
     import httpx as _httpx
+    os.makedirs(_nb_data_dir, exist_ok=True)
+    _auth_path = os.path.join(_nb_data_dir, "auth.json")
     if _nb_auth_json_b64:
         _nb_auth_json = base64.b64decode(_nb_auth_json_b64).decode("utf-8")
     _NB_AUTH_DATA = json.loads(_nb_auth_json)
@@ -73,6 +76,9 @@ if (_nb_auth_json or _nb_auth_json_b64) and _nb_data_dir:
     except Exception as _e:
         print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
 
+    with open(_auth_path, "w", encoding="utf-8") as _f:
+        json.dump(_NB_AUTH_DATA, _f)
+
     # Пре-создаём синглтон клиент напрямую — обходим load_tokens() полностью
     try:
         from notebooklm_mcp_2026 import server as _nb_server_startup
@@ -92,6 +98,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -108,6 +117,9 @@ _nb_conversations: dict[int, str] = {}
 # Локальный прокси (опционально): Railway-бот → локальная машина → NotebookLM
 _NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
 _NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
+_NB_REFRESH_MAX_AGE = 25 * 60
+_nb_last_refresh_at = time.time() if _NB_AUTH_DATA else 0.0
+_nb_query_lock = threading.Lock()
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
 
@@ -157,6 +169,75 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _persist_notebooklm_auth() -> None:
+    if not _nb_data_dir or not _NB_AUTH_DATA:
+        return
+    os.makedirs(_nb_data_dir, exist_ok=True)
+    with open(os.path.join(_nb_data_dir, "auth.json"), "w", encoding="utf-8") as f:
+        json.dump(_NB_AUTH_DATA, f)
+
+
+def _refresh_notebooklm_auth_sync() -> bool:
+    if not _NB_AUTH_DATA:
+        return False
+
+    import httpx as _h
+
+    jar = _h.Cookies()
+    for key, value in _NB_AUTH_DATA.get("cookies", {}).items():
+        jar.set(key, value, domain=".google.com")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        with _h.Client(cookies=jar, headers=headers, follow_redirects=True, timeout=25.0) as client:
+            page = client.get("https://notebooklm.google.com/")
+    except Exception as exc:
+        logger.warning(f"NotebookLM auth refresh failed: {exc}")
+        return False
+
+    if page.status_code != 200 or "accounts.google.com" in str(page.url):
+        logger.warning(f"NotebookLM auth refresh unexpected page: {page.status_code} {page.url}")
+        return False
+
+    csrf_match = re.search(r'"SNlM0e":"([^"]+)"', page.text)
+    if csrf_match:
+        _NB_AUTH_DATA["csrf_token"] = csrf_match.group(1)
+        session_match = re.search(r'"FdrFJe":"(\d+)"', page.text)
+        if session_match:
+            _NB_AUTH_DATA["session_id"] = session_match.group(1)
+
+    build_match = re.search(r'boq_labs-tailwind-frontend_[\w.]+', page.text)
+    build_label = build_match.group(0).rstrip(".") if build_match else None
+    if build_label:
+        os.environ["NOTEBOOKLM_BL"] = build_label
+
+    try:
+        _persist_notebooklm_auth()
+    except Exception as exc:
+        logger.warning(f"NotebookLM auth persist failed: {exc}")
+
+    try:
+        from notebooklm_mcp_2026 import server as nb_server
+        from notebooklm_mcp_2026.client import NotebookLMClient
+        config_module = sys.modules.get("notebooklm_mcp_2026.config")
+        if config_module and build_label:
+            config_module.BUILD_LABEL = build_label
+        nb_server._client = NotebookLMClient(
+            cookies=_NB_AUTH_DATA.get("cookies", {}),
+            csrf_token=_NB_AUTH_DATA.get("csrf_token", ""),
+            session_id=_NB_AUTH_DATA.get("session_id", ""),
+        )
+    except Exception as exc:
+        logger.warning(f"NotebookLM client refresh failed: {exc}")
+        return False
+
+    logger.info(f"NotebookLM auth refresh OK: BL={build_label or 'N/A'} CSRF={'OK' if csrf_match else 'N/A'}")
+    return True
+
+
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
@@ -183,6 +264,7 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 # ─── NotebookLM ──────────────────────────────────────────────────────────────
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
+    global _nb_last_refresh_at
     logger.info(f"NotebookLM query: {query[:80]}")
 
     if _NB_LOCAL_URL:
@@ -217,7 +299,13 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     from notebooklm_mcp_2026.tools.query import query_notebook
     from notebooklm_mcp_2026 import server as _nb_server
 
-    for _attempt in range(2):
+    if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
+        with _nb_query_lock:
+            if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
+                if _refresh_notebooklm_auth_sync():
+                    _nb_last_refresh_at = time.time()
+
+    for _attempt in range(3):
         try:
             result = query_notebook(
                 notebook_id=NOTEBOOK_ID,
@@ -232,8 +320,12 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
                 return result.get("answer", "").strip() or None
 
             error = result.get("error", "")
-            if "401" in str(error) and _attempt == 0:
-                logger.info("NotebookLM 401, пересоздаём клиент с новым CSRF...")
+            if "401" in str(error) and _attempt < 2:
+                logger.info("NotebookLM 401, refreshing auth and retrying...")
+                with _nb_query_lock:
+                    if _refresh_notebooklm_auth_sync():
+                        _nb_last_refresh_at = time.time()
+                continue
                 try:
                     _nb_server.reset_client()
                     from notebooklm_mcp_2026.client import NotebookLMClient as _NbClient
@@ -358,6 +450,30 @@ async def _run_blocking(func, *args):
     return await loop.run_in_executor(None, partial(func, *args))
 
 
+async def _periodic_notebooklm_refresh():
+    global _nb_last_refresh_at
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            def _locked_refresh():
+                with _nb_query_lock:
+                    ok = _refresh_notebooklm_auth_sync()
+                    if ok:
+                        return time.time()
+                    return 0.0
+
+            refreshed_at = await _run_blocking(_locked_refresh)
+            if refreshed_at:
+                _nb_last_refresh_at = refreshed_at
+        except Exception:
+            logger.exception("NotebookLM periodic refresh failed")
+
+
+async def _post_init(app: Application):
+    app.create_task(_periodic_notebooklm_refresh())
+    print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
+
+
 async def _send_long(update: Update, text: str):
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i + 4000])
@@ -455,7 +571,9 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     auth_json_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip())
+    auth_json_b64_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip())
     data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+    lines.append(f"NOTEBOOKLM_AUTH_JSON_B64 set: {auth_json_b64_set}")
     lines.append(f"NOTEBOOKLM_AUTH_JSON задан: {auth_json_set}")
     lines.append(f"NOTEBOOKLM_MCP_DATA_DIR: {data_dir or '(не задан)'}")
     lines.append(f"NOTEBOOKLM_LOCAL_URL: {_NB_LOCAL_URL or '(не задан, прямой режим)'}")
@@ -492,6 +610,16 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     try:
+        answer = await _run_blocking(
+            _ask_notebooklm,
+            "Что такое «Ноль справа»?",
+            update.effective_chat.id,
+        )
+        lines.append(f"Status: {'success' if answer else 'error'}")
+        if answer:
+            lines.append(f"Answer preview:\n{answer[:400]}")
+        await update.message.reply_text("\n".join(lines))
+        return
         from notebooklm_mcp_2026.tools.query import query_notebook
         result = query_notebook(notebook_id=NOTEBOOK_ID, query="Что такое «Ноль справа»?")
         status = result.get("status")
@@ -556,6 +684,7 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .post_init(_post_init)
         .concurrent_updates(True)
         .build()
     )
