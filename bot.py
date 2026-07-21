@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -238,6 +239,49 @@ def _refresh_notebooklm_auth_sync() -> bool:
     return True
 
 
+def _query_notebooklm_once(query: str, conversation_id: str | None) -> dict:
+    script = r"""
+import json
+import sys
+from notebooklm_mcp_2026.tools.query import query_notebook
+
+payload = json.load(sys.stdin)
+result = query_notebook(
+    notebook_id=payload["notebook_id"],
+    query=payload["query"],
+    conversation_id=payload.get("conversation_id") or None,
+)
+print(json.dumps(result, ensure_ascii=False))
+"""
+    payload = {
+        "notebook_id": NOTEBOOK_ID,
+        "query": query,
+        "conversation_id": conversation_id,
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=85,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": "NotebookLM timeout after 85s"}
+
+    if proc.returncode != 0:
+        return {"status": "error", "error": (proc.stderr or proc.stdout)[-2000:]}
+
+    stdout = proc.stdout.strip()
+    if not stdout:
+        return {"status": "error", "error": "NotebookLM subprocess returned empty output"}
+
+    try:
+        return json.loads(stdout.splitlines()[-1])
+    except json.JSONDecodeError as exc:
+        return {"status": "error", "error": f"NotebookLM subprocess JSON error: {exc}; output={stdout[-1000:]}"}
+
+
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
@@ -296,8 +340,6 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
 
     # Прямой режим: импорт notebooklm_mcp_2026 с 401-retry
     conv_id = _nb_conversations.get(chat_id)
-    from notebooklm_mcp_2026.tools.query import query_notebook
-    from notebooklm_mcp_2026 import server as _nb_server
 
     if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
         with _nb_query_lock:
@@ -307,11 +349,7 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
 
     for _attempt in range(3):
         try:
-            result = query_notebook(
-                notebook_id=NOTEBOOK_ID,
-                query=query,
-                conversation_id=conv_id or None,
-            )
+            result = _query_notebooklm_once(query, conv_id or None)
             logger.info(f"NotebookLM status: {result.get('status')} | attempt={_attempt}")
             if result.get("status") == "success":
                 new_conv = result.get("conversation_id")
