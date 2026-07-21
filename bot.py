@@ -470,7 +470,7 @@ async def _periodic_notebooklm_refresh():
 
 
 async def _post_init(app: Application):
-    app.create_task(_periodic_notebooklm_refresh())
+    asyncio.create_task(_periodic_notebooklm_refresh())
     print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
 
 
