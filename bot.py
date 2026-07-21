@@ -6,6 +6,7 @@ Telegram-бот: Coach Grebenyuk — обучение по методологи�
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -29,11 +30,14 @@ load_dotenv()
 
 # На Railway: восстанавливаем auth и создаём клиент из переменной окружения
 _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
+_nb_auth_json_b64 = os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 _NB_AUTH_DATA: dict = {}  # хранится в памяти для переподключения при 401
 
-if _nb_auth_json and _nb_data_dir:
+if (_nb_auth_json or _nb_auth_json_b64) and _nb_data_dir:
     import httpx as _httpx
+    if _nb_auth_json_b64:
+        _nb_auth_json = base64.b64decode(_nb_auth_json_b64).decode("utf-8")
     _NB_AUTH_DATA = json.loads(_nb_auth_json)
     # Получаем свежий CSRF с текущего IP (Railway), т.к. сохранённый CSRF с другого IP не работает
     try:
