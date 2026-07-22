@@ -259,10 +259,24 @@ def _refresh_notebooklm_auth_sync() -> bool:
 def _query_notebooklm_once(query: str, conversation_id: str | None) -> dict:
     script = r"""
 import json
+import os
 import sys
-from notebooklm_mcp_2026.tools.query import query_notebook
 
 payload = json.load(sys.stdin)
+build_label = payload.get("build_label")
+if build_label:
+    os.environ["NOTEBOOKLM_BL"] = build_label
+
+from notebooklm_mcp_2026 import server
+from notebooklm_mcp_2026.client import NotebookLMClient
+from notebooklm_mcp_2026.tools.query import query_notebook
+
+auth = payload.get("auth") or {}
+server._client = NotebookLMClient(
+    cookies=auth.get("cookies", {}),
+    csrf_token=auth.get("csrf_token", ""),
+    session_id=auth.get("session_id", ""),
+)
 result = query_notebook(
     notebook_id=payload["notebook_id"],
     query=payload["query"],
@@ -274,6 +288,8 @@ print(json.dumps(result, ensure_ascii=False))
         "notebook_id": NOTEBOOK_ID,
         "query": query,
         "conversation_id": conversation_id,
+        "auth": _NB_AUTH_DATA,
+        "build_label": os.getenv("NOTEBOOKLM_BL", ""),
     }
     try:
         proc = subprocess.run(
@@ -381,8 +397,9 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
                 return result.get("answer", "").strip() or None
 
             error = result.get("error", "")
-            if "401" in str(error) and _attempt < 2:
-                logger.info("NotebookLM 401, refreshing auth and retrying...")
+            auth_error = "401" in str(error) or "not authenticated" in str(error).lower()
+            if auth_error and _attempt < 2:
+                logger.info("NotebookLM auth error, refreshing credentials and retrying...")
                 with _nb_query_lock:
                     if _refresh_notebooklm_auth_sync():
                         _nb_last_refresh_at = time.time()
