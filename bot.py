@@ -139,6 +139,8 @@ _NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
 _NB_REFRESH_MAX_AGE = 25 * 60
 _nb_last_refresh_at = time.time() if _NB_AUTH_DATA else 0.0
 _nb_query_lock = threading.Lock()
+_nb_source_ids: list[str] = []
+_nb_source_fetch_lock = threading.Lock()
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
 
@@ -169,9 +171,11 @@ def _build_notebooklm_query(question: str, history: list[dict]) -> str:
             lines.append(f"{role}: {msg['text']}")
         context = "Контекст предыдущего диалога:\n" + "\n".join(lines) + "\n\n"
     return (
+        f"{COACH_SYSTEM_PROMPT}\n\n"
         f"{context}"
         f"Вопрос по методологии Гребенюка «Ноль справа»:\n{question}\n\n"
-        "Дай развёрнутый ответ, опираясь на материалы методологии."
+        "Сразу дай готовый ответ ученику, опираясь только на материалы блокнота. "
+        "Не описывай процесс поиска и не добавляй ссылки или номера источников."
     )
 
 
@@ -257,11 +261,16 @@ def _refresh_notebooklm_auth_sync() -> bool:
     return True
 
 
-def _query_notebooklm_once(query: str, conversation_id: str | None) -> dict:
+def _query_notebooklm_once(
+    query: str,
+    conversation_id: str | None,
+    sources_only: bool = False,
+) -> dict:
     script = r"""
 import json
 import os
 import sys
+import time
 
 payload = json.load(sys.stdin)
 build_label = payload.get("build_label")
@@ -269,7 +278,7 @@ if build_label:
     os.environ["NOTEBOOKLM_BL"] = build_label
 
 from notebooklm_mcp_2026 import server
-from notebooklm_mcp_2026.client import NotebookLMClient
+from notebooklm_mcp_2026.client import NotebookLMClient, _extract_source_ids
 from notebooklm_mcp_2026.tools.query import query_notebook
 
 auth = payload.get("auth") or {}
@@ -278,11 +287,42 @@ server._client = NotebookLMClient(
     csrf_token=auth.get("csrf_token", ""),
     session_id=auth.get("session_id", ""),
 )
+
+source_ids = payload.get("source_ids") or []
+source_started = time.monotonic()
+if not source_ids:
+    notebook = server._client.get_notebook(payload["notebook_id"])
+    source_ids = _extract_source_ids(notebook)
+source_seconds = round(time.monotonic() - source_started, 3)
+
+if not source_ids:
+    print(json.dumps({
+        "status": "error",
+        "error": "NotebookLM source list is empty",
+        "_timings": {"sources": source_seconds},
+    }, ensure_ascii=False))
+    raise SystemExit(0)
+
+if payload.get("sources_only"):
+    print(json.dumps({
+        "status": "success",
+        "_source_ids": source_ids,
+        "_timings": {"sources": source_seconds},
+    }, ensure_ascii=False))
+    raise SystemExit(0)
+
+query_started = time.monotonic()
 result = query_notebook(
     notebook_id=payload["notebook_id"],
     query=payload["query"],
+    source_ids=source_ids,
     conversation_id=payload.get("conversation_id") or None,
 )
+result["_source_ids"] = source_ids
+result["_timings"] = {
+    "sources": source_seconds,
+    "query": round(time.monotonic() - query_started, 3),
+}
 print(json.dumps(result, ensure_ascii=False))
 """
     payload = {
@@ -291,6 +331,8 @@ print(json.dumps(result, ensure_ascii=False))
         "conversation_id": conversation_id,
         "auth": _NB_AUTH_DATA,
         "build_label": os.getenv("NOTEBOOKLM_BL", ""),
+        "source_ids": list(_nb_source_ids),
+        "sources_only": sources_only,
     }
     try:
         proc = subprocess.run(
@@ -314,6 +356,26 @@ print(json.dumps(result, ensure_ascii=False))
         return json.loads(stdout.splitlines()[-1])
     except json.JSONDecodeError as exc:
         return {"status": "error", "error": f"NotebookLM subprocess JSON error: {exc}; output={stdout[-1000:]}"}
+
+
+def _prewarm_notebooklm_sources_sync() -> bool:
+    global _nb_source_ids
+    with _nb_source_fetch_lock:
+        if _nb_source_ids:
+            return True
+        result = _query_notebooklm_once("", None, sources_only=True)
+        source_ids = result.get("_source_ids") or []
+        if result.get("status") == "success" and source_ids:
+            _nb_source_ids = list(source_ids)
+            timings = result.get("_timings", {})
+            logger.info(
+                "NotebookLM sources cached: %s sources in %ss",
+                len(_nb_source_ids),
+                timings.get("sources", "?"),
+            )
+            return True
+        logger.warning("NotebookLM source prewarm failed: %s", result.get("error"))
+        return False
 
 
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
@@ -348,7 +410,7 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 # ─── NotebookLM ──────────────────────────────────────────────────────────────
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    global _nb_last_refresh_at
+    global _nb_last_refresh_at, _nb_source_ids
     logger.info(f"NotebookLM query: {query[:80]}")
 
     if _NB_LOCAL_URL:
@@ -381,6 +443,9 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     # Прямой режим: импорт notebooklm_mcp_2026 с 401-retry
     conv_id = _nb_conversations.get(chat_id)
 
+    if not _nb_source_ids:
+        _prewarm_notebooklm_sources_sync()
+
     if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
         with _nb_query_lock:
             if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
@@ -390,7 +455,15 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     for _attempt in range(3):
         try:
             result = _query_notebooklm_once(query, conv_id or None)
-            logger.info(f"NotebookLM status: {result.get('status')} | attempt={_attempt}")
+            source_ids = result.get("_source_ids") or []
+            if source_ids:
+                _nb_source_ids = list(source_ids)
+            logger.info(
+                "NotebookLM status: %s | attempt=%s | timings=%s",
+                result.get("status"),
+                _attempt,
+                result.get("_timings", {}),
+            )
             if result.get("status") == "success":
                 new_conv = result.get("conversation_id")
                 if new_conv:
@@ -545,28 +618,23 @@ def _transcribe(file_path: str) -> str:
     if time.time() >= _gemini_quota_blocked_until:
         client = google_genai.Client(
             api_key=GEMINI_API_KEY,
-            http_options=genai_types.HttpOptions(timeout=120_000),
+            http_options=genai_types.HttpOptions(timeout=25_000),
         )
-        for attempt in range(5):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
-                        TRANSCRIBE_PROMPT,
-                    ],
-                )
-                return response.text.strip()
-            except Exception as exc:
-                if _is_gemini_quota_error(exc):
-                    _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
-                    logger.warning("Gemini transcription quota exhausted; switching to fallback")
-                    break
-                if ("503" in str(exc) or "UNAVAILABLE" in str(exc)) and attempt < 4:
-                    time.sleep(5 * (attempt + 1))
-                    continue
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+                    TRANSCRIBE_PROMPT,
+                ],
+            )
+            return response.text.strip()
+        except Exception as exc:
+            if _is_gemini_quota_error(exc):
+                _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
+                logger.warning("Gemini transcription quota exhausted; switching to fallback")
+            else:
                 logger.warning(f"Gemini transcription failed; switching to fallback: {type(exc).__name__}")
-                break
 
     try:
         return _transcribe_vosk(file_path)
@@ -724,9 +792,17 @@ async def _prewarm_vosk_model():
         logger.exception("Offline speech model prewarm failed")
 
 
+async def _prewarm_notebooklm_sources():
+    try:
+        await _run_blocking(_prewarm_notebooklm_sources_sync)
+    except Exception:
+        logger.exception("NotebookLM source prewarm failed")
+
+
 async def _post_init(app: Application):
     asyncio.create_task(_periodic_notebooklm_refresh())
     asyncio.create_task(_prewarm_vosk_model())
+    asyncio.create_task(_prewarm_notebooklm_sources())
     print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
 
 
@@ -745,6 +821,7 @@ async def _answer(update: Update, question: str):
 
     await update.message.reply_text("Ищу в материалах Гребенюка... ⏳")
     query = _build_notebooklm_query(question, history)
+    started_at = time.monotonic()
     raw = await _run_blocking(_ask_notebooklm, query, chat_id)
 
     if not raw:
@@ -754,13 +831,8 @@ async def _answer(update: Update, question: str):
         )
         return
 
-    await update.message.reply_text("Формулирую ответ... 💭")
-    try:
-        answer = await _run_blocking(_coach_reformat, raw, question, history)
-    except Exception:
-        logger.exception("Gemini reformat error")
-        answer = raw
-    answer = _strip_markdown(answer)
+    answer = _strip_markdown(raw)
+    logger.info("Answer ready in %.2fs", time.monotonic() - started_at)
 
     history.append({"role": "user", "text": question})
     history.append({"role": "assistant", "text": answer[:500]})
