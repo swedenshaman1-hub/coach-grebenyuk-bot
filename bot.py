@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -29,9 +30,9 @@ import vosk
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.genai import types as genai_types
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters,
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
 load_dotenv()
@@ -576,7 +577,11 @@ def _transcribe(file_path: str) -> str:
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
 
-_TTS_CHUNK_LIMIT = 800
+_TTS_CHUNK_LIMIT = 2000
+_TTS_CACHE_TTL = 24 * 60 * 60
+_TTS_CACHE_MAX = 200
+_tts_answers: dict[str, tuple[int, str, float]] = {}
+_tts_in_progress: set[str] = set()
 
 
 def _edge_tts_chunk(text: str) -> str:
@@ -613,38 +618,29 @@ def _tts_chunk(text: str) -> str:
 
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=120_000),
+        http_options=genai_types.HttpOptions(timeout=30_000),
     )
-    response = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=text,
-                config=genai_types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=genai_types.SpeechConfig(
-                        voice_config=genai_types.VoiceConfig(
-                            prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                                voice_name="Sadaltager"
-                            )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=text,
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=genai_types.SpeechConfig(
+                    voice_config=genai_types.VoiceConfig(
+                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                            voice_name="Sadaltager"
                         )
-                    ),
+                    )
                 ),
-            )
-            break
-        except Exception as exc:
-            if _is_gemini_quota_error(exc):
-                _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
-                logger.warning("Gemini TTS quota exhausted; switching to Edge TTS")
-                return _edge_tts_chunk(text)
-            err_str = str(exc).lower()
-            if any(x in err_str for x in ("deadline", "504", "timeout", "timed", "503", "unavailable")) and attempt < 2:
-                time.sleep(8 * (attempt + 1))
-                continue
-            logger.warning(f"Gemini TTS failed; switching to Edge TTS: {type(exc).__name__}")
+            ),
+        )
+    except Exception as exc:
+        if _is_gemini_quota_error(exc):
+            _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
+            logger.warning("Gemini TTS quota exhausted; switching to Edge TTS")
             return _edge_tts_chunk(text)
-    if response is None:
+        logger.warning(f"Gemini TTS failed; switching to Edge TTS: {type(exc).__name__}")
         return _edge_tts_chunk(text)
 
     pcm_data = response.candidates[0].content.parts[0].inline_data.data
@@ -675,9 +671,24 @@ def _split_for_tts(text: str) -> list[str]:
     return chunks
 
 
-def _text_to_speech(text: str) -> list[str]:
-    parts = _split_for_tts(text)
-    return [_tts_chunk(p) for p in parts]
+def _store_tts_answer(chat_id: int, text: str) -> str:
+    """Store the complete answer behind a short Telegram callback token."""
+    now = time.time()
+    expired = [
+        token
+        for token, (_, _, created_at) in _tts_answers.items()
+        if now - created_at > _TTS_CACHE_TTL
+    ]
+    for token in expired:
+        _tts_answers.pop(token, None)
+
+    while len(_tts_answers) >= _TTS_CACHE_MAX:
+        oldest = next(iter(_tts_answers))
+        _tts_answers.pop(oldest, None)
+
+    token = secrets.token_urlsafe(6)
+    _tts_answers[token] = (chat_id, text, now)
+    return token
 
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
@@ -719,9 +730,13 @@ async def _post_init(app: Application):
     print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
 
 
-async def _send_long(update: Update, text: str):
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000])
+async def _send_long(update: Update, text: str, reply_markup=None):
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
+    for index, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            chunk,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
 
 
 async def _answer(update: Update, question: str):
@@ -752,33 +767,80 @@ async def _answer(update: Update, question: str):
     if len(history) > HISTORY_LIMIT:
         _history[chat_id] = history[-HISTORY_LIMIT:]
 
-    await _send_long(update, answer)
-
-    # Для голоса берём первые 600 символов — быстрая генерация, текст уже доставлен
-    voice_text = answer[:600]
-    dot = voice_text.rfind(".")
-    if dot > 200:
-        voice_text = voice_text[:dot + 1].strip()
-
-    audio_paths: list[str] = []
-    try:
-        audio_paths = await asyncio.wait_for(
-            _run_blocking(_text_to_speech, voice_text),
-            timeout=50.0,
+    tts_token = _store_tts_answer(chat_id, answer)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔊 Озвучить полностью",
+            callback_data=f"tts:{tts_token}",
         )
-        for path in audio_paths:
-            with open(path, "rb") as f:
-                await update.message.reply_voice(f)
-    except asyncio.TimeoutError:
-        logger.warning("TTS timeout, skipping voice")
-    except Exception as e:
-        logger.warning(f"TTS failed: {e}")
-    finally:
-        for path in audio_paths:
+    ]])
+    await _send_long(update, answer, reply_markup=keyboard)
+
+
+async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    token = (query.data or "").partition(":")[2]
+    entry = _tts_answers.get(token)
+
+    if not entry or time.time() - entry[2] > _TTS_CACHE_TTL:
+        _tts_answers.pop(token, None)
+        await query.answer(
+            "Эта кнопка устарела. Задай вопрос ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    chat_id, text, _ = entry
+    if chat_id != update.effective_chat.id:
+        await query.answer("Эта кнопка относится к другому чату.", show_alert=True)
+        return
+
+    if token in _tts_in_progress:
+        await query.answer("Этот ответ уже озвучивается.")
+        return
+
+    await query.answer("Начинаю полную озвучку")
+    _tts_in_progress.add(token)
+    status_message = await query.message.reply_text("🔊 Озвучиваю весь ответ...")
+    parts = _split_for_tts(text)
+    sent_parts = 0
+
+    try:
+        for index, part in enumerate(parts, start=1):
+            audio_path = None
             try:
-                os.unlink(path)
-            except Exception:
-                pass
+                audio_path = await asyncio.wait_for(
+                    _run_blocking(_tts_chunk, part),
+                    timeout=75.0,
+                )
+                caption = (
+                    f"🔊 Часть {index}/{len(parts)}"
+                    if len(parts) > 1
+                    else "🔊 Полная озвучка"
+                )
+                with open(audio_path, "rb") as audio:
+                    await query.message.reply_voice(audio, caption=caption)
+                sent_parts += 1
+            finally:
+                if audio_path:
+                    try:
+                        os.unlink(audio_path)
+                    except OSError:
+                        pass
+
+        await status_message.edit_text("✅ Полная озвучка готова.")
+    except asyncio.TimeoutError:
+        logger.warning("Full-answer TTS timed out after part %s", sent_parts)
+        await status_message.edit_text(
+            f"Не удалось озвучить часть {sent_parts + 1}. Нажми кнопку ещё раз."
+        )
+    except Exception as exc:
+        logger.exception("Full-answer TTS failed: %s", exc)
+        await status_message.edit_text(
+            f"Не удалось завершить озвучку после части {sent_parts}. Попробуй ещё раз."
+        )
+    finally:
+        _tts_in_progress.discard(token)
 
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
@@ -940,6 +1002,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CallbackQueryHandler(handle_tts, pattern=r"^tts:"))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
