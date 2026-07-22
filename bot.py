@@ -11,15 +11,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
+import zipfile
 from collections import defaultdict
 from functools import partial
 
+import edge_tts
+import speech_recognition as sr
+import vosk
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.genai import types as genai_types
@@ -105,6 +111,17 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+_GEMINI_QUOTA_RECHECK_SECONDS = 15 * 60
+_gemini_quota_blocked_until = 0.0
+_VOSK_MODEL_NAME = "vosk-model-small-ru-0.22"
+_VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{_VOSK_MODEL_NAME}.zip"
+_VOSK_MODEL_DIR = os.getenv(
+    "VOSK_MODEL_DIR",
+    os.path.join(tempfile.gettempdir(), _VOSK_MODEL_NAME),
+)
+_vosk_model = None
+_vosk_model_lock = threading.Lock()
 
 NOTEBOOK_ID = "85da7d6e-6980-4da0-89a9-4efabc9542bc"
 
@@ -283,6 +300,7 @@ print(json.dumps(result, ensure_ascii=False))
 
 
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
+    global _gemini_quota_blocked_until
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=60_000),
@@ -301,7 +319,12 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
         f"Информация из материалов методологии (используй как источник, перепиши своими словами):\n{raw_answer}\n\n"
         "Дай ответ в роли коуча. Только ответ, без вводных фраз типа 'Конечно!' или 'Отличный вопрос!'."
     )
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    try:
+        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    except Exception as exc:
+        if _is_gemini_quota_error(exc):
+            _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
+        raise
     return response.text.strip()
 
 
@@ -387,28 +410,151 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
 
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
 
+def _is_gemini_quota_error(exc: Exception) -> bool:
+    error = str(exc).lower()
+    return "resource_exhausted" in error or "prepayment credits are depleted" in error
+
+
+def _get_vosk_model():
+    global _vosk_model
+    with _vosk_model_lock:
+        if _vosk_model is not None:
+            return _vosk_model
+
+        if not os.path.isdir(_VOSK_MODEL_DIR):
+            model_parent = os.path.dirname(_VOSK_MODEL_DIR)
+            os.makedirs(model_parent, exist_ok=True)
+            zip_path = os.path.join(model_parent, f"{_VOSK_MODEL_NAME}.zip")
+            logger.info("Downloading offline Russian speech model...")
+            with urllib.request.urlopen(_VOSK_MODEL_URL, timeout=90) as response:
+                with open(zip_path, "wb") as output:
+                    shutil.copyfileobj(response, output)
+            try:
+                with zipfile.ZipFile(zip_path) as archive:
+                    parent_real = os.path.realpath(model_parent)
+                    for member in archive.infolist():
+                        target = os.path.realpath(os.path.join(model_parent, member.filename))
+                        if target != parent_real and not target.startswith(parent_real + os.sep):
+                            raise RuntimeError("Unsafe path in Vosk model archive")
+                    archive.extractall(model_parent)
+            finally:
+                try:
+                    os.unlink(zip_path)
+                except OSError:
+                    pass
+
+        vosk.SetLogLevel(-1)
+        _vosk_model = vosk.Model(_VOSK_MODEL_DIR)
+        logger.info("Offline Russian speech model is ready")
+        return _vosk_model
+
+
+def _convert_to_wav(file_path: str) -> str:
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    converted = subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", file_path,
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if converted.returncode != 0:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"ffmpeg conversion failed: {converted.stderr[-300:]}")
+    return wav_path
+
+
+def _transcribe_vosk(file_path: str) -> str:
+    """Полностью автономная русская расшифровка внутри Railway."""
+    wav_path = _convert_to_wav(file_path)
+    try:
+        model = _get_vosk_model()
+        pieces: list[str] = []
+        with wave.open(wav_path, "rb") as audio:
+            recognizer = vosk.KaldiRecognizer(model, audio.getframerate())
+            while True:
+                data = audio.readframes(4000)
+                if not data:
+                    break
+                if recognizer.AcceptWaveform(data):
+                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                    if text:
+                        pieces.append(text)
+            final_text = json.loads(recognizer.FinalResult()).get("text", "").strip()
+            if final_text:
+                pieces.append(final_text)
+
+        result = " ".join(pieces).strip()
+        if not result:
+            raise RuntimeError("offline transcription returned empty text")
+        return result
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
+def _transcribe_google_web(file_path: str) -> str:
+    """Резервная расшифровка без Gemini API и платных кредитов."""
+    wav_path = _convert_to_wav(file_path)
+    try:
+        recognizer = sr.Recognizer()
+        recognizer.operation_timeout = 30
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+        result = recognizer.recognize_google(audio, language="ru-RU").strip()
+        if not result:
+            raise RuntimeError("fallback transcription returned empty text")
+        return result
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
 def _transcribe(file_path: str) -> str:
+    global _gemini_quota_blocked_until
     with open(file_path, "rb") as f:
         audio_bytes = f.read()
-    client = google_genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=120_000),
-    )
-    for attempt in range(5):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
-                    TRANSCRIBE_PROMPT,
-                ],
-            )
-            return response.text.strip()
-        except Exception as e:
-            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 4:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
+    if time.time() >= _gemini_quota_blocked_until:
+        client = google_genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=genai_types.HttpOptions(timeout=120_000),
+        )
+        for attempt in range(5):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[
+                        genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+                        TRANSCRIBE_PROMPT,
+                    ],
+                )
+                return response.text.strip()
+            except Exception as exc:
+                if _is_gemini_quota_error(exc):
+                    _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
+                    logger.warning("Gemini transcription quota exhausted; switching to fallback")
+                    break
+                if ("503" in str(exc) or "UNAVAILABLE" in str(exc)) and attempt < 4:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                logger.warning(f"Gemini transcription failed; switching to fallback: {type(exc).__name__}")
+                break
+
+    try:
+        return _transcribe_vosk(file_path)
+    except Exception as exc:
+        logger.exception(f"Offline transcription failed; trying Google Speech: {exc}")
+        return _transcribe_google_web(file_path)
 
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
@@ -416,7 +562,38 @@ def _transcribe(file_path: str) -> str:
 _TTS_CHUNK_LIMIT = 800
 
 
+def _edge_tts_chunk(text: str) -> str:
+    """Резервная озвучка без Gemini API и платных кредитов."""
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+
+    async def _save() -> None:
+        communicate = edge_tts.Communicate(
+            text,
+            voice="ru-RU-DmitryNeural",
+            connect_timeout=10,
+            receive_timeout=30,
+        )
+        await communicate.save(path)
+
+    try:
+        asyncio.run(_save())
+        if os.path.getsize(path) == 0:
+            raise RuntimeError("Edge TTS returned an empty audio file")
+        return path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def _tts_chunk(text: str) -> str:
+    global _gemini_quota_blocked_until
+    if time.time() < _gemini_quota_blocked_until:
+        return _edge_tts_chunk(text)
+
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=120_000),
@@ -439,14 +616,19 @@ def _tts_chunk(text: str) -> str:
                 ),
             )
             break
-        except Exception as e:
-            err_str = str(e).lower()
+        except Exception as exc:
+            if _is_gemini_quota_error(exc):
+                _gemini_quota_blocked_until = time.time() + _GEMINI_QUOTA_RECHECK_SECONDS
+                logger.warning("Gemini TTS quota exhausted; switching to Edge TTS")
+                return _edge_tts_chunk(text)
+            err_str = str(exc).lower()
             if any(x in err_str for x in ("deadline", "504", "timeout", "timed", "503", "unavailable")) and attempt < 2:
                 time.sleep(8 * (attempt + 1))
                 continue
-            raise
+            logger.warning(f"Gemini TTS failed; switching to Edge TTS: {type(exc).__name__}")
+            return _edge_tts_chunk(text)
     if response is None:
-        raise RuntimeError("TTS: все попытки исчерпаны")
+        return _edge_tts_chunk(text)
 
     pcm_data = response.candidates[0].content.parts[0].inline_data.data
     fd, path = tempfile.mkstemp(suffix=".wav")
@@ -507,8 +689,16 @@ async def _periodic_notebooklm_refresh():
             logger.exception("NotebookLM periodic refresh failed")
 
 
+async def _prewarm_vosk_model():
+    try:
+        await _run_blocking(_get_vosk_model)
+    except Exception:
+        logger.exception("Offline speech model prewarm failed")
+
+
 async def _post_init(app: Application):
     asyncio.create_task(_periodic_notebooklm_refresh())
+    asyncio.create_task(_prewarm_vosk_model())
     print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
 
 
@@ -698,7 +888,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _answer(update, question)
     except Exception as e:
         logger.exception("Transcription error")
-        await update.message.reply_text(f"Не удалось расшифровать: {e}")
+        await update.message.reply_text(
+            "Не удалось разобрать голосовое сообщение. Отправь его ещё раз "
+            "или напиши вопрос текстом."
+        )
     finally:
         try:
             os.unlink(tmp_path)
