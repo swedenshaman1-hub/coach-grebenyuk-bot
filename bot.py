@@ -1004,6 +1004,27 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def _send_invitation(message, token: str):
+    invite_url = f"https://t.me/{BOT_USERNAME}?start={token}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚀 Принять приглашение", url=invite_url)
+    ]])
+    await message.reply_text(
+        "🚀 <b>Приглашение в «Архитектор роста»</b>\n\n"
+        "Персональный AI-бизнес-коуч поможет вам:\n\n"
+        "• найти главные точки роста бизнеса;\n"
+        "• усилить продукт, продажи и управление;\n"
+        "• превратить финансовую цель в понятный план;\n"
+        "• получить конкретные решения и следующие шаги.\n\n"
+        "🎁 Доступ предоставляется на 7 дней с момента активации.\n"
+        "Приглашение персональное и действует для одного Telegram-аккаунта.\n\n"
+        "Нажмите кнопку ниже, чтобы начать.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
 async def _send_admin_panel(message, context: ContextTypes.DEFAULT_TYPE, pin: bool = False):
     panel = await message.reply_text(
         "Панель администратора\n\n"
@@ -1067,13 +1088,7 @@ async def cmd_invite7(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_chat.id):
         return
     token = access_db.create_invite(update.effective_chat.id, 7)
-    link = f"https://t.me/{BOT_USERNAME}?start={token}"
-    await update.message.reply_text(
-        "Одноразовая ссылка на доступ в течение 7 дней:\n\n"
-        f"{link}\n\n"
-        "Срок начнётся с момента первой активации. Ссылка привяжется "
-        "к Telegram-аккаунту первого человека, который её откроет."
-    )
+    await _send_invitation(update.message, token)
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1119,11 +1134,7 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _send_admin_panel(query.message, context)
     elif data == "admin:invite7":
         token = access_db.create_invite(update.effective_chat.id, 7)
-        link = f"https://t.me/{BOT_USERNAME}?start={token}"
-        await query.message.reply_text(
-            f"Готовая одноразовая ссылка на 7 дней:\n\n{link}\n\n"
-            "Перешли её тестировщику."
-        )
+        await _send_invitation(query.message, token)
     elif data == "admin:users":
         await _send_active_users(query.message)
     elif data == "admin:help":
