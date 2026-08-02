@@ -39,6 +39,7 @@ from telegram.ext import (
 )
 
 load_dotenv()
+import knowledge_store
 
 # На Railway: восстанавливаем auth и создаём клиент из переменной окружения
 _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
@@ -46,7 +47,11 @@ _nb_auth_json_b64 = os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 _NB_AUTH_DATA: dict = {}  # хранится в памяти для переподключения при 401
 
-if (_nb_auth_json or _nb_auth_json_b64) and _nb_data_dir:
+if (
+    (_nb_auth_json or _nb_auth_json_b64)
+    and _nb_data_dir
+    and not knowledge_store.is_configured()
+):
     import httpx as _httpx
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
@@ -72,7 +77,7 @@ if (_nb_auth_json or _nb_auth_json_b64) and _nb_data_dir:
                 _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
                 if _m2:
                     _NB_AUTH_DATA["session_id"] = _m2.group(1)
-                print(f"Startup CSRF OK: {_NB_AUTH_DATA['csrf_token'][:35]}...", flush=True)
+                print("Startup CSRF refresh succeeded", flush=True)
             else:
                 print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
             # Авто-определяем build label — Google меняет его раз в несколько недель.
@@ -137,6 +142,7 @@ NOTEBOOK_ID = "85da7d6e-6980-4da0-89a9-4efabc9542bc"
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
 HISTORY_LIMIT = 6
+_chat_answer_locks: dict[int, asyncio.Lock] = {}
 
 # Локальный прокси (опционально): Railway-бот → локальная машина → NotebookLM
 _NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
@@ -179,6 +185,13 @@ COACH_SYSTEM_PROMPT = """Ты — «Архитектор роста», перс�
 
 
 def _build_notebooklm_query(question: str, history: list[dict]) -> str:
+    return (
+        f"{COACH_SYSTEM_PROMPT}\n\n"
+        f"{_build_knowledge_query(question, history)}"
+    )
+
+
+def _build_knowledge_query(question: str, history: list[dict]) -> str:
     context = ""
     if history:
         lines = []
@@ -187,7 +200,6 @@ def _build_notebooklm_query(question: str, history: list[dict]) -> str:
             lines.append(f"{role}: {msg['text']}")
         context = "Контекст предыдущего диалога:\n" + "\n".join(lines) + "\n\n"
     return (
-        f"{COACH_SYSTEM_PROMPT}\n\n"
         f"{context}"
         f"Вопрос пользователя:\n{question}\n\n"
         "Сразу дай готовый самостоятельный ответ пользователю. "
@@ -211,6 +223,18 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'(?i)Notebook\s*LM', 'внутренняя система знаний', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _limit_answer_words(text: str, max_words: int = 200) -> str:
+    """Enforce the public response limit without cutting a recent sentence."""
+    matches = list(re.finditer(r"\S+", text))
+    if len(matches) <= max_words:
+        return text.strip()
+    prefix = text[:matches[max_words - 1].end()].rstrip()
+    sentence_ends = list(re.finditer(r"[.!?](?=\s|$)", prefix))
+    if sentence_ends and sentence_ends[-1].end() >= int(len(prefix) * 0.7):
+        return prefix[:sentence_ends[-1].end()].strip()
+    return prefix.rstrip(" ,;:—-") + "…"
 
 
 def _query_notebooklm_once(
@@ -528,6 +552,56 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     return None
 
 
+def _ask_primary_knowledge(query: str, chat_id: int = 0) -> tuple[str | None, str]:
+    """Use persistent File Search first and the legacy notebook only as backup."""
+    global _nb_last_error
+    file_search_error = ""
+
+    if knowledge_store.is_configured():
+        try:
+            result = knowledge_store.ask(
+                GEMINI_API_KEY,
+                query,
+                system_instruction=COACH_SYSTEM_PROMPT,
+            )
+            _nb_last_error = ""
+            return result.text, "file_search"
+        except Exception as exc:
+            file_search_error = f"File Search: {type(exc).__name__}: {exc}"
+            logger.exception("Primary File Search query failed")
+
+    legacy_available = bool(_NB_LOCAL_URL or _NB_AUTH_DATA.get("cookies"))
+    if legacy_available:
+        legacy_query = f"{COACH_SYSTEM_PROMPT}\n\n{query}"
+        answer = _ask_notebooklm(legacy_query, chat_id)
+        if answer:
+            if file_search_error:
+                logger.warning("Serving answer from legacy notebook fallback")
+            return answer, "notebooklm"
+        legacy_error = _nb_last_error
+        _nb_last_error = "; ".join(
+            part for part in (file_search_error, f"legacy notebook: {legacy_error}") if part
+        )
+        return None, ""
+
+    _nb_last_error = file_search_error or "No source-grounded knowledge provider is configured"
+    return None, ""
+
+
+def _prewarm_primary_knowledge_sync() -> bool:
+    """A deployment is healthy only after a real grounded retrieval succeeds."""
+    global _nb_last_error
+    if knowledge_store.is_configured():
+        ok, detail = knowledge_store.health_check(GEMINI_API_KEY)
+        _nb_last_error = "" if ok else detail
+        if ok:
+            logger.info("Primary knowledge health OK: %s", detail)
+        else:
+            logger.warning("Primary knowledge health failed: %s", detail)
+        return ok
+    return _prewarm_notebooklm_sources_sync()
+
+
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
 
 def _is_gemini_quota_error(exc: Exception) -> bool:
@@ -801,7 +875,16 @@ async def _notify_admin_notebooklm(bot, error: str, force: bool = False):
     if not force and now - _nb_last_admin_alert_at < _NB_ADMIN_ALERT_INTERVAL:
         return
     _nb_last_admin_alert_at = now
-    if _is_notebooklm_auth_error(error):
+    error_value = str(error).lower()
+    if knowledge_store.is_configured() and any(
+        marker in error_value for marker in ("429", "quota", "resource_exhausted")
+    ):
+        reason = "достигнут лимит Gemini API или временно недоступен биллинг проекта."
+    elif knowledge_store.is_configured() and any(
+        marker in error_value for marker in ("401", "403", "api key", "permission")
+    ):
+        reason = "Gemini API отклонил ключ или доступ к хранилищу."
+    elif _is_notebooklm_auth_error(error) and not knowledge_store.is_configured():
         reason = (
             "истекла авторизация Google. Нужно один раз повторно войти в "
             "NotebookLM на компьютере, после чего обновить сессию Railway."
@@ -828,7 +911,7 @@ async def _periodic_notebooklm_health(app: Application):
     while True:
         try:
             was_ok = _nb_health_ok
-            is_ok = await _run_blocking(_prewarm_notebooklm_sources_sync)
+            is_ok = await _run_blocking(_prewarm_primary_knowledge_sync)
             _nb_health_ok = is_ok
             if not is_ok:
                 await _notify_admin_notebooklm(app.bot, _nb_last_error or "health check failed")
@@ -836,7 +919,7 @@ async def _periodic_notebooklm_health(app: Application):
                 for admin_id in ADMIN_CHAT_IDS:
                     await app.bot.send_message(
                         chat_id=admin_id,
-                        text="✅ Связь с NotebookLM восстановлена.",
+                        text="✅ Связь с основной базой знаний восстановлена.",
                     )
         except Exception:
             logger.exception("NotebookLM periodic health check failed")
@@ -853,7 +936,7 @@ async def _prewarm_vosk_model():
 async def _prewarm_notebooklm_sources(app: Application):
     global _nb_health_ok
     try:
-        _nb_health_ok = await _run_blocking(_prewarm_notebooklm_sources_sync)
+        _nb_health_ok = await _run_blocking(_prewarm_primary_knowledge_sync)
         if not _nb_health_ok:
             await _notify_admin_notebooklm(app.bot, _nb_last_error or "startup health check failed")
     except Exception:
@@ -913,7 +996,7 @@ async def _post_init(app: Application):
     asyncio.create_task(_periodic_notebooklm_health(app))
     asyncio.create_task(_prewarm_vosk_model())
     asyncio.create_task(_prewarm_notebooklm_sources(app))
-    print("Periodic NotebookLM health check scheduled (every 30m)", flush=True)
+    print("Periodic knowledge health check scheduled (every 30m)", flush=True)
 
 
 async def _send_long(update: Update, text: str, reply_markup=None):
@@ -925,7 +1008,7 @@ async def _send_long(update: Update, text: str, reply_markup=None):
         )
 
 
-async def _answer(update: Update, question: str):
+async def _answer_unlocked(update: Update, question: str):
     global _nb_health_ok
     chat_id = update.effective_chat.id
     if not _is_allowed(chat_id):
@@ -937,7 +1020,11 @@ async def _answer(update: Update, question: str):
     now = int(time.time())
 
     if cached:
-        ttl = _NB_CACHE_TTL if cached["source"] == "notebooklm" else _FALLBACK_CACHE_TTL
+        ttl = (
+            _NB_CACHE_TTL
+            if cached["source"] in {"notebooklm", "file_search"}
+            else _FALLBACK_CACHE_TTL
+        )
         if now - int(cached["created_at"]) <= ttl:
             answer = str(cached["answer"]).strip()
             logger.info("Answer served from cache: source=%s", cached["source"])
@@ -950,11 +1037,11 @@ async def _answer(update: Update, question: str):
     source = "cache"
     if not answer:
         await update.message.reply_text("Анализирую вопрос... ⏳")
-        query = _build_notebooklm_query(question, history)
-        raw = await _run_blocking(_ask_notebooklm, query, chat_id)
+        query = _build_knowledge_query(question, history)
+        raw, source_name = await _run_blocking(_ask_primary_knowledge, query, chat_id)
         if raw:
             answer = _strip_markdown(raw)
-            source = "notebooklm"
+            source = source_name
             _nb_health_ok = True
         else:
             _nb_health_ok = False
@@ -962,19 +1049,19 @@ async def _answer(update: Update, question: str):
             if cached and str(cached["answer"]).strip():
                 answer = str(cached["answer"]).strip()
                 source = "stale_cache"
-                logger.warning("NotebookLM unavailable; serving stale cached answer")
+                logger.warning("Primary knowledge unavailable; serving stale cached answer")
             else:
                 answer = _emergency_coach_answer(question)
                 source = "emergency"
-                logger.warning("NotebookLM unavailable; serving local emergency answer")
+                logger.warning("Primary knowledge unavailable; serving local emergency answer")
 
     # Access may be revoked while a long knowledge query is running.
     if not _is_allowed(chat_id):
         await _send_access_denied(update.message)
         return
 
-    answer = _strip_markdown(answer).strip()
-    if source == "notebooklm":
+    answer = _limit_answer_words(_strip_markdown(answer).strip())
+    if source in {"notebooklm", "file_search"}:
         access_db.store_cached_answer(cache_key, question, answer, source)
     logger.info(
         "Answer ready in %.2fs | source=%s | chars=%s",
@@ -996,6 +1083,17 @@ async def _answer(update: Update, question: str):
         )
     ]])
     await _send_long(update, answer, reply_markup=keyboard)
+
+
+async def _answer(update: Update, question: str):
+    """Keep each chat ordered while allowing different chats to run concurrently."""
+    chat_id = update.effective_chat.id
+    lock = _chat_answer_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_answer_locks[chat_id] = lock
+    async with lock:
+        await _answer_unlocked(update, question)
 
 
 async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1300,78 +1398,26 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _nb_health_ok
     if not _is_admin(update.effective_chat.id):
         return
-    lines = []
-    auth_json_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip())
-    auth_json_b64_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip())
-    data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
-    lines.append(f"NOTEBOOKLM_AUTH_JSON_B64 set: {auth_json_b64_set}")
-    lines.append(f"NOTEBOOKLM_AUTH_JSON задан: {auth_json_set}")
-    lines.append(f"NOTEBOOKLM_MCP_DATA_DIR: {data_dir or '(не задан)'}")
-    lines.append(f"NOTEBOOKLM_LOCAL_URL: {_NB_LOCAL_URL or '(не задан, прямой режим)'}")
-
-    if data_dir:
-        auth_path = os.path.join(data_dir, "auth.json")
-        exists = os.path.exists(auth_path)
-        lines.append(f"auth.json существует: {exists}")
-        if exists:
-            try:
-                with open(auth_path) as f:
-                    data = json.load(f)
-                cookies = data.get("cookies", {})
-                csrf = data.get("csrf_token", "")
-                lines.append(f"Кук: {list(cookies.keys())[:4]}...")
-                lines.append(f"CSRF: {csrf[:40]}..." if csrf else "CSRF: (пусто)")
-            except Exception as e:
-                lines.append(f"Ошибка чтения auth.json: {e}")
-
-    # Статус singleton клиента
-    try:
-        from notebooklm_mcp_2026 import server as _nb_srv
-        from notebooklm_mcp_2026.auth import load_tokens as _lt
-        lines.append(f"nb_server._client: {'создан' if _nb_srv._client else 'None'}")
-        tok = _lt()
-        lines.append(f"load_tokens(): {'OK' if tok else 'NONE!'}")
-    except Exception as _de:
-        lines.append(f"diagnostics error: {_de}")
-
-    lines.append(f"_NB_AUTH_DATA cookies: {list(_NB_AUTH_DATA.get('cookies', {}).keys())[:3]}")
-
-    lines.append("\nЗапрашиваю NotebookLM (тест)...")
-    await update.message.reply_text("\n".join(lines))
-    lines = []
-
-    try:
-        answer = await _run_blocking(
-            _ask_notebooklm,
-            "Что такое «Ноль справа»?",
-            update.effective_chat.id,
+    provider = "Gemini File Search" if knowledge_store.is_configured() else "резервный источник"
+    await update.message.reply_text(
+        f"Проверяю основную базу знаний…\nПровайдер: {provider}"
+    )
+    started_at = time.monotonic()
+    _nb_health_ok = await _run_blocking(_prewarm_primary_knowledge_sync)
+    elapsed = time.monotonic() - started_at
+    if _nb_health_ok:
+        await update.message.reply_text(
+            f"✅ Статус: работает\nПроверка ответа: успешно\nВремя: {elapsed:.1f} с"
         )
-        lines.append(f"Status: {'success' if answer else 'error'}")
-        if answer:
-            lines.append(f"Answer preview:\n{answer[:400]}")
-        await update.message.reply_text("\n".join(lines))
-        return
-        from notebooklm_mcp_2026.tools.query import query_notebook
-        result = query_notebook(notebook_id=NOTEBOOK_ID, query="Что такое «Ноль справа»?")
-        status = result.get("status")
-        error = result.get("error", "")
-        hint = result.get("hint", "")
-        answer = result.get("answer", "")
-        lines.append(f"Статус: {status}")
-        if error:
-            lines.append(f"Ошибка: {error}")
-        if hint:
-            lines.append(f"Подсказка: {hint}")
-        if answer:
-            lines.append(f"Ответ (200 симв.):\n{answer[:200]}")
-    except Exception as e:
-        import traceback
-        lines.append(f"Исключение: {e}")
-        lines.append(traceback.format_exc()[-800:])
-
-    await update.message.reply_text("\n".join(lines))
+    else:
+        logger.error("Admin knowledge diagnostic failed: %s", _nb_last_error)
+        await update.message.reply_text(
+            "❌ Статус: основная база временно недоступна. "
+            "Подробность записана в защищённый журнал сервера."
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1422,7 +1468,12 @@ def main():
 
     access_db.init_db()
 
-    mode = f"прокси → {_NB_LOCAL_URL}" if _NB_LOCAL_URL else "прямой импорт"
+    if knowledge_store.is_configured():
+        mode = "Gemini File Search"
+    elif _NB_LOCAL_URL:
+        mode = f"резервный прокси → {_NB_LOCAL_URL}"
+    else:
+        mode = "резервный прямой импорт"
     print(f"Архитектор роста запускается... knowledge mode: {mode}")
     print(f"Администраторы: {sorted(ADMIN_CHAT_IDS)}")
     print(f"База доступа: {access_db.DB_PATH}")

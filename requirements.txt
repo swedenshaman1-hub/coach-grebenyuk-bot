@@ -1,4 +1,4 @@
-google-genai>=1.0.0
+google-genai>=2.16.0,<3.0.0
 edge-tts>=7.2.3
 SpeechRecognition>=3.14.3
 vosk>=0.3.45
