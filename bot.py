@@ -801,11 +801,19 @@ async def _notify_admin_notebooklm(bot, error: str, force: bool = False):
     if not force and now - _nb_last_admin_alert_at < _NB_ADMIN_ALERT_INTERVAL:
         return
     _nb_last_admin_alert_at = now
-    safe_error = " ".join(str(error).split())[:700]
+    if _is_notebooklm_auth_error(error):
+        reason = (
+            "истекла авторизация Google. Нужно один раз повторно войти в "
+            "NotebookLM на компьютере, после чего обновить сессию Railway."
+        )
+    elif _is_notebooklm_transient_error(error):
+        reason = "временная ошибка соединения; следующая проверка будет выполнена автоматически."
+    else:
+        reason = "основной источник не ответил; следующая проверка будет выполнена автоматически."
     text = (
-        "⚠️ NotebookLM временно недоступен. Пользователи получают безопасный "
-        "резервный ответ, бот продолжает работать.\n\n"
-        f"Диагностика: {safe_error or 'ответ отсутствует'}"
+        "⚠️ Основная база знаний временно недоступна. Бот продолжает отвечать "
+        "пользователям в резервном режиме.\n\n"
+        f"Причина: {reason}"
     )
     for admin_id in ADMIN_CHAT_IDS:
         try:
