@@ -64,6 +64,21 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_history_chat_id_id "
+            "ON chat_history(chat_id, id DESC)"
+        )
 
 
 def format_expiry(timestamp: int) -> str:
@@ -216,3 +231,56 @@ def store_cached_answer(
             )
             """
         )
+
+
+def get_chat_history(chat_id: int, limit: int = 6) -> list[dict[str, str]]:
+    with closing(_connect()) as connection, connection:
+        rows = connection.execute(
+            """
+            SELECT role, text
+            FROM chat_history
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, max(1, int(limit))),
+        ).fetchall()
+    return [
+        {"role": str(row["role"]), "text": str(row["text"])}
+        for row in reversed(rows)
+    ]
+
+
+def append_chat_exchange(
+    chat_id: int,
+    user_text: str,
+    assistant_text: str,
+    limit: int = 6,
+) -> None:
+    now = int(time.time())
+    with closing(_connect()) as connection, connection:
+        connection.execute(
+            "INSERT INTO chat_history(chat_id, role, text, created_at) VALUES (?, 'user', ?, ?)",
+            (chat_id, user_text[:2000], now),
+        )
+        connection.execute(
+            "INSERT INTO chat_history(chat_id, role, text, created_at) VALUES (?, 'assistant', ?, ?)",
+            (chat_id, assistant_text[:2000], now),
+        )
+        connection.execute(
+            """
+            DELETE FROM chat_history
+            WHERE chat_id = ? AND id NOT IN (
+                SELECT id FROM chat_history
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (chat_id, chat_id, max(2, int(limit))),
+        )
+
+
+def clear_chat_history(chat_id: int) -> None:
+    with closing(_connect()) as connection, connection:
+        connection.execute("DELETE FROM chat_history WHERE chat_id = ?", (chat_id,))

@@ -17,7 +17,6 @@ import time
 import urllib.request
 import wave
 import zipfile
-from collections import defaultdict
 from functools import partial
 
 import access_control as access_db
@@ -139,8 +138,6 @@ _vosk_model_lock = threading.Lock()
 
 NOTEBOOK_ID = "85da7d6e-6980-4da0-89a9-4efabc9542bc"
 
-# История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
-_history: dict[int, list[dict]] = defaultdict(list)
 HISTORY_LIMIT = 6
 _chat_answer_locks: dict[int, asyncio.Lock] = {}
 
@@ -205,6 +202,22 @@ def _build_knowledge_query(question: str, history: list[dict]) -> str:
         "Сразу дай готовый самостоятельный ответ пользователю. "
         "Не описывай процесс поиска, не называй происхождение знаний и не добавляй ссылки или номера источников."
     )
+
+
+def _needs_missing_context_clarification(question: str, history: list[dict]) -> bool:
+    if history:
+        return False
+    normalized = " ".join(re.sub(r"[^а-яёa-z0-9]+", " ", question.lower()).split())
+    return normalized in {
+        "давай дальше",
+        "продолжай",
+        "продолжим",
+        "что дальше",
+        "поехали дальше",
+        "да",
+        "ок",
+        "хорошо",
+    }
 
 
 def _strip_markdown(text: str) -> str:
@@ -1014,7 +1027,13 @@ async def _answer_unlocked(update: Update, question: str):
     if not _is_allowed(chat_id):
         await _send_access_denied(update.message)
         return
-    history = _history[chat_id]
+    history = access_db.get_chat_history(chat_id, HISTORY_LIMIT)
+    if _needs_missing_context_clarification(question, history):
+        await update.message.reply_text(
+            "Мне не хватает предыдущего контекста, чтобы продолжить точно. "
+            "Напиши одним предложением, какую задачу мы разбирали, — и я сразу подхвачу."
+        )
+        return
     cache_key = _answer_cache_key(question, history)
     cached = access_db.get_cached_answer(cache_key)
     now = int(time.time())
@@ -1070,10 +1089,12 @@ async def _answer_unlocked(update: Update, question: str):
         len(answer),
     )
 
-    history.append({"role": "user", "text": question})
-    history.append({"role": "assistant", "text": answer[:500]})
-    if len(history) > HISTORY_LIMIT:
-        _history[chat_id] = history[-HISTORY_LIMIT:]
+    access_db.append_chat_exchange(
+        chat_id,
+        question,
+        answer,
+        HISTORY_LIMIT,
+    )
 
     tts_token = _store_tts_answer(chat_id, answer)
     keyboard = InlineKeyboardMarkup([[
@@ -1333,7 +1354,7 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    _history[chat_id].clear()
+    access_db.clear_chat_history(chat_id)
 
     if context.args and not _is_admin(chat_id):
         token = context.args[0].strip()
@@ -1385,7 +1406,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(chat_id):
         await _send_access_denied(update.message)
         return
-    _history[chat_id].clear()
+    access_db.clear_chat_history(chat_id)
     await update.message.reply_text("Диалог сброшен. Начинаем с чистого листа. О чём поговорим?")
 
 
