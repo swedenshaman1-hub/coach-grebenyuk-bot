@@ -53,6 +53,17 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS answer_cache (
+                cache_key TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def format_expiry(timestamp: int) -> str:
@@ -165,3 +176,43 @@ def extend_access(chat_id: int, days: int = 7) -> int | None:
             (expires_at, now, chat_id),
         )
     return expires_at
+
+
+def get_cached_answer(cache_key: str) -> sqlite3.Row | None:
+    with closing(_connect()) as connection, connection:
+        return connection.execute(
+            "SELECT answer, source, created_at FROM answer_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+
+
+def store_cached_answer(
+    cache_key: str,
+    question: str,
+    answer: str,
+    source: str,
+) -> None:
+    now = int(time.time())
+    with closing(_connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO answer_cache(cache_key, question, answer, source, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                question = excluded.question,
+                answer = excluded.answer,
+                source = excluded.source,
+                created_at = excluded.created_at
+            """,
+            (cache_key, question, answer, source, now),
+        )
+        connection.execute(
+            """
+            DELETE FROM answer_cache
+            WHERE cache_key NOT IN (
+                SELECT cache_key FROM answer_cache
+                ORDER BY created_at DESC
+                LIMIT 500
+            )
+            """
+        )

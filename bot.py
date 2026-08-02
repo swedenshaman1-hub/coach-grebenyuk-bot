@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -137,17 +138,18 @@ NOTEBOOK_ID = "85da7d6e-6980-4da0-89a9-4efabc9542bc"
 _history: dict[int, list[dict]] = defaultdict(list)
 HISTORY_LIMIT = 6
 
-# conversation_id для продолжения диалога в NotebookLM
-_nb_conversations: dict[int, str] = {}
-
 # Локальный прокси (опционально): Railway-бот → локальная машина → NotebookLM
 _NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
 _NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
-_NB_REFRESH_MAX_AGE = 25 * 60
-_nb_last_refresh_at = time.time() if _NB_AUTH_DATA else 0.0
-_nb_query_lock = threading.Lock()
+_nb_request_lock = threading.BoundedSemaphore(2)
 _nb_source_ids: list[str] = []
 _nb_source_fetch_lock = threading.Lock()
+_nb_health_ok: bool | None = None
+_nb_last_admin_alert_at = 0.0
+_nb_last_error = ""
+_NB_ADMIN_ALERT_INTERVAL = 6 * 60 * 60
+_NB_CACHE_TTL = 30 * 24 * 60 * 60
+_FALLBACK_CACHE_TTL = 6 * 60 * 60
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
 
@@ -211,75 +213,6 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _persist_notebooklm_auth() -> None:
-    if not _nb_data_dir or not _NB_AUTH_DATA:
-        return
-    os.makedirs(_nb_data_dir, exist_ok=True)
-    with open(os.path.join(_nb_data_dir, "auth.json"), "w", encoding="utf-8") as f:
-        json.dump(_NB_AUTH_DATA, f)
-
-
-def _refresh_notebooklm_auth_sync() -> bool:
-    if not _NB_AUTH_DATA:
-        return False
-
-    import httpx as _h
-
-    jar = _h.Cookies()
-    for key, value in _NB_AUTH_DATA.get("cookies", {}).items():
-        jar.set(key, value, domain=".google.com")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        with _h.Client(cookies=jar, headers=headers, follow_redirects=True, timeout=25.0) as client:
-            page = client.get("https://notebooklm.google.com/")
-    except Exception as exc:
-        logger.warning(f"NotebookLM auth refresh failed: {exc}")
-        return False
-
-    if page.status_code != 200 or "accounts.google.com" in str(page.url):
-        logger.warning(f"NotebookLM auth refresh unexpected page: {page.status_code} {page.url}")
-        return False
-
-    csrf_match = re.search(r'"SNlM0e":"([^"]+)"', page.text)
-    if csrf_match:
-        _NB_AUTH_DATA["csrf_token"] = csrf_match.group(1)
-        session_match = re.search(r'"FdrFJe":"(\d+)"', page.text)
-        if session_match:
-            _NB_AUTH_DATA["session_id"] = session_match.group(1)
-
-    build_match = re.search(r'boq_labs-tailwind-frontend_[\w.]+', page.text)
-    build_label = build_match.group(0).rstrip(".") if build_match else None
-    if build_label:
-        os.environ["NOTEBOOKLM_BL"] = build_label
-
-    try:
-        _persist_notebooklm_auth()
-    except Exception as exc:
-        logger.warning(f"NotebookLM auth persist failed: {exc}")
-
-    try:
-        from notebooklm_mcp_2026 import server as nb_server
-        from notebooklm_mcp_2026.client import NotebookLMClient
-        config_module = sys.modules.get("notebooklm_mcp_2026.config")
-        if config_module and build_label:
-            config_module.BUILD_LABEL = build_label
-        nb_server._client = NotebookLMClient(
-            cookies=_NB_AUTH_DATA.get("cookies", {}),
-            csrf_token=_NB_AUTH_DATA.get("csrf_token", ""),
-            session_id=_NB_AUTH_DATA.get("session_id", ""),
-        )
-    except Exception as exc:
-        logger.warning(f"NotebookLM client refresh failed: {exc}")
-        return False
-
-    logger.info(f"NotebookLM auth refresh OK: BL={build_label or 'N/A'} CSRF={'OK' if csrf_match else 'N/A'}")
-    return True
-
-
 def _query_notebooklm_once(
     query: str,
     conversation_id: str | None,
@@ -307,11 +240,11 @@ server._client = NotebookLMClient(
     session_id=auth.get("session_id", ""),
 )
 
-source_ids = payload.get("source_ids") or []
 source_started = time.monotonic()
-if not source_ids:
-    notebook = server._client.get_notebook(payload["notebook_id"])
-    source_ids = _extract_source_ids(notebook)
+# This authenticated read is deliberate. The query endpoint can return HTTP 200
+# with an empty answer when Google has redirected an expired session to login.
+notebook = server._client.get_notebook(payload["notebook_id"])
+source_ids = _extract_source_ids(notebook)
 source_seconds = round(time.monotonic() - source_started, 3)
 
 if not source_ids:
@@ -335,8 +268,15 @@ result = query_notebook(
     notebook_id=payload["notebook_id"],
     query=payload["query"],
     source_ids=source_ids,
-    conversation_id=payload.get("conversation_id") or None,
+    conversation_id=None,
 )
+answer = str(result.get("answer") or "").strip()
+if result.get("status") == "success" and not answer:
+    result["status"] = "error"
+    result["error"] = (
+        "NotebookLM returned an empty answer; authentication or session is stale"
+    )
+    result["_empty_answer"] = True
 result["_source_ids"] = source_ids
 result["_timings"] = {
     "sources": source_seconds,
@@ -378,23 +318,24 @@ print(json.dumps(result, ensure_ascii=False))
 
 
 def _prewarm_notebooklm_sources_sync() -> bool:
-    global _nb_source_ids
-    with _nb_source_fetch_lock:
-        if _nb_source_ids:
-            return True
+    global _nb_last_error, _nb_source_ids
+    with _nb_request_lock, _nb_source_fetch_lock:
         result = _query_notebooklm_once("", None, sources_only=True)
-        source_ids = result.get("_source_ids") or []
-        if result.get("status") == "success" and source_ids:
-            _nb_source_ids = list(source_ids)
-            timings = result.get("_timings", {})
-            logger.info(
-                "NotebookLM sources cached: %s sources in %ss",
-                len(_nb_source_ids),
-                timings.get("sources", "?"),
-            )
-            return True
-        logger.warning("NotebookLM source prewarm failed: %s", result.get("error"))
-        return False
+    source_ids = result.get("_source_ids") or []
+    if result.get("status") == "success" and source_ids:
+        _nb_source_ids = list(source_ids)
+        timings = result.get("_timings", {})
+        logger.info(
+            "NotebookLM health OK: %s sources in %ss",
+            len(_nb_source_ids),
+            timings.get("sources", "?"),
+        )
+        _nb_last_error = ""
+        return True
+    _nb_source_ids = []
+    _nb_last_error = str(result.get("error") or "NotebookLM health check failed")
+    logger.warning("NotebookLM health failed: %s", _nb_last_error)
+    return False
 
 
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
@@ -426,10 +367,75 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
     return response.text.strip()
 
 
+def _answer_cache_key(question: str, history: list[dict]) -> str:
+    context = [
+        {"role": item.get("role", ""), "text": str(item.get("text", ""))[:500]}
+        for item in history[-4:]
+    ]
+    payload = json.dumps(
+        {"v": 1, "question": " ".join(question.lower().split()), "history": context},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _emergency_coach_answer(question: str) -> str:
+    """Useful local response when all source-grounded retries are unavailable."""
+    short_question = " ".join(question.split())[:220]
+    return (
+        f"Разберём задачу практично. Твой запрос: «{short_question}». "
+        "Сначала зафиксируй текущую точку в цифрах: выручка, чистая прибыль, "
+        "количество лидов, конверсия в продажу и средний чек. Затем выбери одно "
+        "главное ограничение, которое сейчас сильнее всего тормозит результат: "
+        "нехватка обращений, слабая конверсия, низкий чек, повторные продажи или "
+        "перегрузка команды. На ближайшие семь дней поставь один измеримый "
+        "эксперимент именно для этого ограничения и заранее определи критерий успеха.\n\n"
+        "Напиши пять текущих цифр и главное ограничение — я помогу собрать следующий шаг."
+    )
+
+
 # ─── NotebookLM ──────────────────────────────────────────────────────────────
 
+def _is_notebooklm_auth_error(error: str) -> bool:
+    value = str(error).lower()
+    return any(
+        marker in value
+        for marker in (
+            "401",
+            "not authenticated",
+            "authentication expired",
+            "cookies expired",
+            "rpc error 16",
+            "redirected to google login",
+            "accounts.google.com",
+        )
+    )
+
+
+def _is_notebooklm_transient_error(error: str) -> bool:
+    value = str(error).lower()
+    return any(
+        marker in value
+        for marker in (
+            "timeout",
+            "timed out",
+            "429",
+            "too many requests",
+            "500",
+            "502",
+            "503",
+            "504",
+            "connection reset",
+            "temporarily unavailable",
+            "empty answer",
+        )
+    )
+
+
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    global _nb_last_refresh_at, _nb_source_ids
+    global _nb_last_error, _nb_source_ids
+    _nb_last_error = ""
     logger.info(f"NotebookLM query: {query[:80]}")
 
     if _NB_LOCAL_URL:
@@ -450,70 +456,74 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
                 data = json.loads(resp.read().decode("utf-8"))
             if data.get("ok"):
                 answer = data.get("answer", "").strip()
+                if not answer:
+                    _nb_last_error = "NotebookLM proxy returned an empty answer"
+                    logger.error("NotebookLM proxy returned an empty answer")
+                    return None
                 logger.info(f"NotebookLM proxy: {len(answer)} символов")
-                return answer or None
+                return answer
             else:
+                _nb_last_error = str(data.get("error") or "NotebookLM proxy error")
                 logger.error(f"NotebookLM proxy error: {data.get('error')}")
                 return None
         except Exception as e:
+            _nb_last_error = f"NotebookLM proxy exception: {type(e).__name__}: {e}"
             logger.exception(f"NotebookLM proxy exception: {e}")
             return None
 
-    # Прямой режим: импорт notebooklm_mcp_2026 с 401-retry
-    conv_id = _nb_conversations.get(chat_id)
+    # Limit concurrency to protect the unofficial endpoint from request bursts
+    # while still allowing two users to receive answers in parallel.
+    with _nb_request_lock:
+        started_at = time.monotonic()
+        for attempt in range(2):
+            try:
+                result = _query_notebooklm_once(query, None)
+            except Exception as exc:
+                _nb_last_error = f"NotebookLM exception: {type(exc).__name__}: {exc}"
+                logger.exception("NotebookLM exception: %s", exc)
+                return None
 
-    if not _nb_source_ids:
-        _prewarm_notebooklm_sources_sync()
-
-    if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
-        with _nb_query_lock:
-            if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
-                if _refresh_notebooklm_auth_sync():
-                    _nb_last_refresh_at = time.time()
-
-    for _attempt in range(3):
-        try:
-            result = _query_notebooklm_once(query, conv_id or None)
             source_ids = result.get("_source_ids") or []
             if source_ids:
                 _nb_source_ids = list(source_ids)
+
+            answer = str(result.get("answer") or "").strip()
             logger.info(
-                "NotebookLM status: %s | attempt=%s | timings=%s",
+                "NotebookLM status: %s | attempt=%s | answer_chars=%s | timings=%s",
                 result.get("status"),
-                _attempt,
+                attempt,
+                len(answer),
                 result.get("_timings", {}),
             )
-            if result.get("status") == "success":
-                new_conv = result.get("conversation_id")
-                if new_conv:
-                    _nb_conversations[chat_id] = new_conv
-                return result.get("answer", "").strip() or None
+            if result.get("status") == "success" and answer:
+                return answer
 
-            error = result.get("error", "")
-            auth_error = "401" in str(error) or "not authenticated" in str(error).lower()
-            if auth_error and _attempt < 2:
-                logger.info("NotebookLM auth error, refreshing credentials and retrying...")
-                with _nb_query_lock:
-                    if _refresh_notebooklm_auth_sync():
-                        _nb_last_refresh_at = time.time()
-                continue
-                try:
-                    _nb_server.reset_client()
-                    from notebooklm_mcp_2026.client import NotebookLMClient as _NbClient
-                    # csrf_token="" → конструктор сам получит свежий CSRF через _refresh_auth_tokens()
-                    _nb_server._client = _NbClient(
-                        cookies=_NB_AUTH_DATA.get("cookies", {}),
-                        csrf_token="",
-                        session_id=_NB_AUTH_DATA.get("session_id", ""),
-                    )
-                except Exception as _re:
-                    logger.warning(f"Клиент не пересоздан: {_re}")
+            if result.get("status") == "success" and not answer:
+                error = "NotebookLM returned an empty answer"
+            else:
+                error = str(result.get("error") or "unknown NotebookLM error")
+            if _is_notebooklm_auth_error(error):
+                _nb_last_error = error
+                logger.error("NotebookLM authentication expired: %s", error[:500])
+                return None
+
+            can_retry = (
+                attempt == 0
+                and _is_notebooklm_transient_error(error)
+                and time.monotonic() - started_at < 20
+            )
+            if can_retry:
+                logger.warning("NotebookLM transient error; one retry: %s", error[:500])
+                _nb_source_ids = []
+                time.sleep(1)
                 continue
 
-            logger.error(f"NotebookLM error: {error} | hint: {result.get('hint', '')}")
-            return None
-        except Exception as e:
-            logger.exception(f"NotebookLM exception: {e}")
+            logger.error(
+                "NotebookLM error: %s | hint: %s",
+                error[:1000],
+                str(result.get("hint") or "")[:500],
+            )
+            _nb_last_error = error
             return None
     return None
 
@@ -785,23 +795,44 @@ async def _run_blocking(func, *args):
     return await loop.run_in_executor(None, partial(func, *args))
 
 
-async def _periodic_notebooklm_refresh():
-    global _nb_last_refresh_at
-    while True:
-        await asyncio.sleep(1800)
+async def _notify_admin_notebooklm(bot, error: str, force: bool = False):
+    global _nb_last_admin_alert_at
+    now = time.time()
+    if not force and now - _nb_last_admin_alert_at < _NB_ADMIN_ALERT_INTERVAL:
+        return
+    _nb_last_admin_alert_at = now
+    safe_error = " ".join(str(error).split())[:700]
+    text = (
+        "⚠️ NotebookLM временно недоступен. Пользователи получают безопасный "
+        "резервный ответ, бот продолжает работать.\n\n"
+        f"Диагностика: {safe_error or 'ответ отсутствует'}"
+    )
+    for admin_id in ADMIN_CHAT_IDS:
         try:
-            def _locked_refresh():
-                with _nb_query_lock:
-                    ok = _refresh_notebooklm_auth_sync()
-                    if ok:
-                        return time.time()
-                    return 0.0
-
-            refreshed_at = await _run_blocking(_locked_refresh)
-            if refreshed_at:
-                _nb_last_refresh_at = refreshed_at
+            await bot.send_message(chat_id=admin_id, text=text)
         except Exception:
-            logger.exception("NotebookLM periodic refresh failed")
+            logger.exception("Could not send NotebookLM alert to admin %s", admin_id)
+
+
+async def _periodic_notebooklm_health(app: Application):
+    global _nb_health_ok
+    await asyncio.sleep(300)
+    while True:
+        try:
+            was_ok = _nb_health_ok
+            is_ok = await _run_blocking(_prewarm_notebooklm_sources_sync)
+            _nb_health_ok = is_ok
+            if not is_ok:
+                await _notify_admin_notebooklm(app.bot, _nb_last_error or "health check failed")
+            elif was_ok is False:
+                for admin_id in ADMIN_CHAT_IDS:
+                    await app.bot.send_message(
+                        chat_id=admin_id,
+                        text="✅ Связь с NotebookLM восстановлена.",
+                    )
+        except Exception:
+            logger.exception("NotebookLM periodic health check failed")
+        await asyncio.sleep(1800)
 
 
 async def _prewarm_vosk_model():
@@ -811,10 +842,14 @@ async def _prewarm_vosk_model():
         logger.exception("Offline speech model prewarm failed")
 
 
-async def _prewarm_notebooklm_sources():
+async def _prewarm_notebooklm_sources(app: Application):
+    global _nb_health_ok
     try:
-        await _run_blocking(_prewarm_notebooklm_sources_sync)
+        _nb_health_ok = await _run_blocking(_prewarm_notebooklm_sources_sync)
+        if not _nb_health_ok:
+            await _notify_admin_notebooklm(app.bot, _nb_last_error or "startup health check failed")
     except Exception:
+        _nb_health_ok = False
         logger.exception("NotebookLM source prewarm failed")
 
 
@@ -867,10 +902,10 @@ async def _post_init(app: Application):
     except Exception:
         logger.exception("Telegram profile configuration failed")
 
-    asyncio.create_task(_periodic_notebooklm_refresh())
+    asyncio.create_task(_periodic_notebooklm_health(app))
     asyncio.create_task(_prewarm_vosk_model())
-    asyncio.create_task(_prewarm_notebooklm_sources())
-    print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
+    asyncio.create_task(_prewarm_notebooklm_sources(app))
+    print("Periodic NotebookLM health check scheduled (every 30m)", flush=True)
 
 
 async def _send_long(update: Update, text: str, reply_markup=None):
@@ -883,31 +918,62 @@ async def _send_long(update: Update, text: str, reply_markup=None):
 
 
 async def _answer(update: Update, question: str):
+    global _nb_health_ok
     chat_id = update.effective_chat.id
     if not _is_allowed(chat_id):
         await _send_access_denied(update.message)
         return
     history = _history[chat_id]
+    cache_key = _answer_cache_key(question, history)
+    cached = access_db.get_cached_answer(cache_key)
+    now = int(time.time())
 
-    await update.message.reply_text("Анализирую вопрос... ⏳")
-    query = _build_notebooklm_query(question, history)
+    if cached:
+        ttl = _NB_CACHE_TTL if cached["source"] == "notebooklm" else _FALLBACK_CACHE_TTL
+        if now - int(cached["created_at"]) <= ttl:
+            answer = str(cached["answer"]).strip()
+            logger.info("Answer served from cache: source=%s", cached["source"])
+        else:
+            answer = ""
+    else:
+        answer = ""
+
     started_at = time.monotonic()
-    raw = await _run_blocking(_ask_notebooklm, query, chat_id)
+    source = "cache"
+    if not answer:
+        await update.message.reply_text("Анализирую вопрос... ⏳")
+        query = _build_notebooklm_query(question, history)
+        raw = await _run_blocking(_ask_notebooklm, query, chat_id)
+        if raw:
+            answer = _strip_markdown(raw)
+            source = "notebooklm"
+            _nb_health_ok = True
+        else:
+            _nb_health_ok = False
+            await _notify_admin_notebooklm(update.get_bot(), _nb_last_error)
+            if cached and str(cached["answer"]).strip():
+                answer = str(cached["answer"]).strip()
+                source = "stale_cache"
+                logger.warning("NotebookLM unavailable; serving stale cached answer")
+            else:
+                answer = _emergency_coach_answer(question)
+                source = "emergency"
+                logger.warning("NotebookLM unavailable; serving local emergency answer")
 
     # Access may be revoked while a long knowledge query is running.
     if not _is_allowed(chat_id):
         await _send_access_denied(update.message)
         return
 
-    if not raw:
-        await update.message.reply_text(
-            "Не удалось подготовить ответ. "
-            "Попробуй переформулировать вопрос или повторить чуть позже."
-        )
-        return
-
-    answer = _strip_markdown(raw)
-    logger.info("Answer ready in %.2fs", time.monotonic() - started_at)
+    answer = _strip_markdown(answer).strip()
+    if source == "notebooklm":
+        access_db.store_cached_answer(cache_key, question, answer, source)
+    logger.info(
+        "Answer ready in %.2fs | source=%s | chars=%s",
+        time.monotonic() - started_at,
+        source,
+        len(answer),
+    )
 
     history.append({"role": "user", "text": question})
     history.append({"role": "assistant", "text": answer[:500]})
@@ -1214,7 +1280,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_access_denied(update.message)
         return
     _history[chat_id].clear()
-    _nb_conversations.pop(chat_id, None)
     await update.message.reply_text("Диалог сброшен. Начинаем с чистого листа. О чём поговорим?")
 
 
