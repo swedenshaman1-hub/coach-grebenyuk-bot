@@ -32,6 +32,10 @@ class StaticPolicyTests(unittest.TestCase):
         self.assertNotIn("google_search=", production)
         self.assertNotIn("web_search", production)
 
+    def test_telegram_profile_mutation_is_opt_in(self):
+        bot = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("SYNC_TELEGRAM_PROFILE", "false")', bot)
+
 
 if __name__ == "__main__":
     unittest.main()

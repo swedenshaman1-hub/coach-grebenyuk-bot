@@ -491,42 +491,48 @@ async def _send_access_denied(message):
 
 
 async def _post_init(app: Application):
-    try:
-        await app.bot.set_my_name("Архитектор роста")
-        await app.bot.set_my_short_description(
-            "AI-бизнес-коуч по продажам, управлению, прибыли и системному росту."
-        )
-        await app.bot.set_my_description(
-            "Персональный AI-бизнес-коуч. Помогает диагностировать бизнес, "
-            "находить точки роста, усиливать продажи, выстраивать команду, "
-            "декомпозировать цели и превращать идеи в конкретный план действий."
-        )
-        await app.bot.set_my_commands([
-            BotCommand("start", "Начать работу"),
-            BotCommand("help", "Проверить доступ"),
-            BotCommand("reset", "Начать новый диалог"),
-        ])
-        for admin_id in ADMIN_CHAT_IDS:
-            await app.bot.set_my_commands(
-                [
-                    BotCommand("admin", "Панель администратора"),
-                    BotCommand("invite7", "Создать доступ на 7 дней"),
-                    BotCommand("users", "Активные пользователи"),
-                    BotCommand("start", "Открыть ассистента"),
-                    BotCommand("reset", "Начать новый диалог"),
-                    BotCommand("help", "Команды администратора"),
-                    BotCommand("id", "Показать Telegram ID"),
-                    BotCommand("health", "Проверить все компоненты"),
-                    BotCommand("sources", "Активные блокноты"),
-                    BotCommand("verify", "Свежая проверка вопроса"),
-                    BotCommand("cache", "Проверить карточку вопроса"),
-                    BotCommand("debug", "Безопасная диагностика"),
-                ],
-                scope=BotCommandScopeChat(chat_id=admin_id),
+    # Telegram rate-limits profile mutations very aggressively. The profile is
+    # already configured in BotFather, so production restarts must not rewrite
+    # it. Enable this flag only for an intentional one-time profile update.
+    if os.getenv("SYNC_TELEGRAM_PROFILE", "false").lower() in {"1", "true", "yes", "on"}:
+        try:
+            await app.bot.set_my_name("Архитектор роста")
+            await app.bot.set_my_short_description(
+                "AI-бизнес-коуч по продажам, управлению, прибыли и системному росту."
             )
-        logger.info("Telegram profile configured: Архитектор роста")
-    except Exception:
-        logger.exception("Telegram profile configuration failed")
+            await app.bot.set_my_description(
+                "Персональный AI-бизнес-коуч. Помогает диагностировать бизнес, "
+                "находить точки роста, усиливать продажи, выстраивать команду, "
+                "декомпозировать цели и превращать идеи в конкретный план действий."
+            )
+            await app.bot.set_my_commands([
+                BotCommand("start", "Начать работу"),
+                BotCommand("help", "Проверить доступ"),
+                BotCommand("reset", "Начать новый диалог"),
+            ])
+            for admin_id in ADMIN_CHAT_IDS:
+                await app.bot.set_my_commands(
+                    [
+                        BotCommand("admin", "Панель администратора"),
+                        BotCommand("invite7", "Создать доступ на 7 дней"),
+                        BotCommand("users", "Активные пользователи"),
+                        BotCommand("start", "Открыть ассистента"),
+                        BotCommand("reset", "Начать новый диалог"),
+                        BotCommand("help", "Команды администратора"),
+                        BotCommand("id", "Показать Telegram ID"),
+                        BotCommand("health", "Проверить все компоненты"),
+                        BotCommand("sources", "Активные блокноты"),
+                        BotCommand("verify", "Свежая проверка вопроса"),
+                        BotCommand("cache", "Проверить карточку вопроса"),
+                        BotCommand("debug", "Безопасная диагностика"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+            logger.info("Telegram profile configured: Архитектор роста")
+        except Exception:
+            logger.exception("Telegram profile configuration failed")
+    else:
+        logger.info("Telegram profile sync skipped on startup")
 
     asyncio.create_task(_periodic_notebooklm_health(app))
     asyncio.create_task(_prewarm_vosk_model())
