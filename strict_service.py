@@ -91,6 +91,29 @@ class StrictKnowledgeService:
             f"{card.answer}"
         )
 
+    @staticmethod
+    def _clarification_text(missing_information: list[str]) -> str:
+        """Turn NotebookLM's missing inputs into a useful coaching continuation."""
+        items: list[str] = []
+        for value in missing_information[:5]:
+            text = " ".join(str(value).split()).strip(" -•\t")[:240]
+            if text:
+                if not text.endswith(("?", ".", "!")):
+                    text += "?"
+                items.append(text)
+        if not items:
+            items = [
+                "Чем занимается твой бизнес и какой продукт ты продаёшь?",
+                "Кто сейчас твой основной клиент?",
+                "Какой текущий результат и к какой цели ты хочешь прийти?",
+                "Что ты считаешь главным ограничением роста сейчас?",
+            ]
+        questions = "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
+        return (
+            "Давай начнём с короткой диагностики. Ответь, пожалуйста:\n\n"
+            f"{questions}\n\nМожно одним сообщением — я соберу ответы и предложу следующий шаг."
+        )
+
     def answer(
         self,
         question: str,
@@ -181,8 +204,9 @@ class StrictKnowledgeService:
                 )
                 return ServiceAnswer(
                     status=ResultStatus.INSUFFICIENT,
+                    text=self._clarification_text(parsed.missing_information),
                     request_id=request_id,
-                    source_kind="notebooklm_fresh",
+                    source_kind="notebooklm_clarification",
                     attempts=total_attempts,
                 )
             if not parsed.is_verified:

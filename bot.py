@@ -575,10 +575,24 @@ async def _answer_unlocked(update: Update, question: str, force_fresh: bool = Fa
         _nb_last_error = result.error_type.value
         await _notify_admin_notebooklm(update.get_bot(), _nb_last_error)
     elif result.status is ResultStatus.INSUFFICIENT:
-        await update.message.reply_text(
-            "В доступных материалах недостаточно информации, чтобы дать "
-            "подтверждённый ответ. Я не буду дополнять его догадками."
+        _nb_health_ok = True
+        _nb_last_error = ""
+        clarification = result.text.strip() or (
+            "Чтобы продолжить предметно, напиши, чем занимается твой бизнес, "
+            "какой сейчас результат и какую цель ты хочешь получить."
         )
+        access_db.append_chat_exchange(
+            chat_id,
+            question,
+            clarification,
+            HISTORY_LIMIT,
+        )
+        logger.info(
+            "Strict clarification ready in %.2fs | request=%s",
+            time.monotonic() - started_at,
+            result.request_id,
+        )
+        await update.message.reply_text(clarification)
         return
     elif result.status is ResultStatus.AUTH_REQUIRED:
         _nb_health_ok = False

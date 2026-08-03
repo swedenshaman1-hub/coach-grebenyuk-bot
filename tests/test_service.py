@@ -95,6 +95,36 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result.status, ResultStatus.AUTH_REQUIRED)
         self.assertEqual(result.text, "")
 
+    def test_insufficient_becomes_actionable_clarification(self):
+        insufficient_raw = json.dumps(
+            {
+                "status": "insufficient",
+                "answer": "",
+                "claims": [],
+                "missing_information": [
+                    "Чем занимается бизнес",
+                    "Какой текущий результат",
+                ],
+                "confidence": "insufficient",
+            },
+            ensure_ascii=False,
+        )
+        self.service.gateway = FakeGateway(
+            GatewayResponse(
+                ok=True,
+                raw_answer=insufficient_raw,
+                conversation_id="conversation",
+                sources=[SourceInfo(id="src-1", title="Метод пяти единичек")],
+                source_fingerprint="fingerprint",
+                attempts=1,
+            )
+        )
+        result = self.service.answer("Давай начнем с моего бизнеса", [], 10)
+        self.assertEqual(result.status, ResultStatus.INSUFFICIENT)
+        self.assertEqual(result.source_kind, "notebooklm_clarification")
+        self.assertIn("короткой диагностики", result.text)
+        self.assertIn("Чем занимается бизнес?", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

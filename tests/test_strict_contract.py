@@ -5,6 +5,7 @@ from strict_contract import (
     ResultStatus,
     SourceInfo,
     build_strict_prompt,
+    is_coaching_start,
     parse_and_validate,
     render_verified_answer,
 )
@@ -98,6 +99,12 @@ class StrictContractTests(unittest.TestCase):
         prompt = build_strict_prompt("Как расти?", [])
         self.assertIn("Запрещено использовать интернет", prompt)
         self.assertIn("фоновые знания модели", prompt)
+
+    def test_coaching_start_is_not_treated_as_a_factual_dead_end(self):
+        prompt = build_strict_prompt("Давай начнем с развития моего бизнеса", [])
+        self.assertTrue(is_coaching_start("Ну что, работать будем?"))
+        self.assertIn("начать или продолжить коучинговую работу", prompt)
+        self.assertIn("Не считай отсутствие исходных цифр причиной для отказа", prompt)
 
 
 if __name__ == "__main__":
