@@ -17,6 +17,7 @@ from strict_contract import (
     ErrorType,
     ResultStatus,
     build_strict_prompt,
+    is_coaching_opening,
     is_coaching_start,
     parse_and_validate,
     render_verified_answer,
@@ -128,6 +129,24 @@ class StrictKnowledgeService:
     ) -> ServiceAnswer:
         request_id = str(uuid.uuid4())
         started = time.monotonic()
+        if is_coaching_opening(question) and not history and not force_fresh:
+            text = self._clarification_text([])
+            self._log(
+                request_id,
+                chat_id,
+                "local_clarification",
+                started,
+                0,
+                ResultStatus.INSUFFICIENT,
+                ErrorType.NONE,
+            )
+            return ServiceAnswer(
+                status=ResultStatus.INSUFFICIENT,
+                text=text,
+                source_kind="local_clarification",
+                request_id=request_id,
+                attempts=0,
+            )
         cache_key = self.repository.cache_key(
             self.collection.id, question, history
         )

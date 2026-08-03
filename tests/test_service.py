@@ -119,7 +119,12 @@ class ServiceTests(unittest.TestCase):
                 attempts=1,
             )
         )
-        result = self.service.answer("Давай начнем с моего бизнеса", [], 10)
+        result = self.service.answer(
+            "Давай начнем с моего бизнеса",
+            [],
+            10,
+            force_fresh=True,
+        )
         self.assertEqual(result.status, ResultStatus.INSUFFICIENT)
         self.assertEqual(result.source_kind, "notebooklm_clarification")
         self.assertIn("короткой диагностики", result.text)
@@ -130,10 +135,30 @@ class ServiceTests(unittest.TestCase):
             "Давай начнем с развития моего бизнеса",
             [],
             10,
+            force_fresh=True,
         )
         self.assertEqual(result.status, ResultStatus.VERIFIED)
         self.assertGreaterEqual(result.text.count("?"), 4)
         self.assertIn("главным ограничением роста", result.text)
+
+    def test_session_opening_is_immediate_and_does_not_call_knowledge(self):
+        self.service.gateway = FakeGateway(
+            GatewayResponse(
+                ok=False,
+                error_type=ErrorType.UNKNOWN,
+                error="must not be called",
+                attempts=1,
+            )
+        )
+        result = self.service.answer(
+            "Давай начнем с развития моего бизнеса",
+            [],
+            10,
+        )
+        self.assertEqual(result.status, ResultStatus.INSUFFICIENT)
+        self.assertEqual(result.source_kind, "local_clarification")
+        self.assertEqual(result.attempts, 0)
+        self.assertGreaterEqual(result.text.count("?"), 4)
 
 
 if __name__ == "__main__":

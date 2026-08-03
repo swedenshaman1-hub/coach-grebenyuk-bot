@@ -5,6 +5,7 @@ from strict_contract import (
     ResultStatus,
     SourceInfo,
     build_strict_prompt,
+    is_coaching_opening,
     is_coaching_start,
     parse_and_validate,
     render_verified_answer,
@@ -105,6 +106,9 @@ class StrictContractTests(unittest.TestCase):
         self.assertTrue(is_coaching_start("Ну что, работать будем?"))
         self.assertIn("начать или продолжить коучинговую работу", prompt)
         self.assertIn("Не считай отсутствие исходных цифр причиной для отказа", prompt)
+        self.assertTrue(is_coaching_opening("Давай начнем с развития моего бизнеса"))
+        self.assertTrue(is_coaching_opening("Ну что, работать будем?"))
+        self.assertFalse(is_coaching_opening("Как начать развивать продажи бизнеса?"))
 
 
 if __name__ == "__main__":

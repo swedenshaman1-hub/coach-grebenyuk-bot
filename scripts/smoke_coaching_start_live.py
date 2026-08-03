@@ -17,17 +17,22 @@ def main() -> int:
     )
     service.init()
     question = "Давай начнем с развития моего бизнеса."
-    result = service.answer(question, [], -900000001, force_fresh=True)
+    result = service.answer(question, [], -900000001)
     actionable = bool(result.text.strip()) and "?" in result.text
     print(
         f"status={result.status.value} source={result.source_kind} "
         f"attempts={result.attempts} chars={len(result.text)} actionable={actionable}"
     )
+    if result.status is ResultStatus.INSUFFICIENT:
+        safe_clarification = (
+            actionable
+            and "диагностик" in result.text.lower()
+            and result.source_kind == "local_clarification"
+            and result.attempts == 0
+        )
+        return 0 if safe_clarification else 4
     if result.status is ResultStatus.VERIFIED:
         return 0 if actionable and result.source_kind == "notebooklm_fresh" else 3
-    if result.status is ResultStatus.INSUFFICIENT:
-        safe_clarification = actionable and "диагностик" in result.text.lower()
-        return 0 if safe_clarification else 4
     return 5
 
 

@@ -114,10 +114,22 @@ _COACHING_START_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_COACHING_OPENING_RE = re.compile(
+    r"(?:\bдавай\s+(?:начн|приступ)|\bну\s+что.{0,40}\bработат|"
+    r"\bработать\s+будем|\bприступим\b|\bначинаем\b|"
+    r"\bхочу\s+(?:начать|разобрать).{0,60}\b(?:бизнес|работ))",
+    flags=re.IGNORECASE,
+)
+
 
 def is_coaching_start(question: str) -> bool:
     """Recognize a request to begin coaching rather than a factual question."""
     return bool(_COACHING_START_RE.search(" ".join(question.split())))
+
+
+def is_coaching_opening(question: str) -> bool:
+    """Recognize a pure invitation to start, with no factual answer required."""
+    return bool(_COACHING_OPENING_RE.search(" ".join(question.split())))
 
 
 def build_strict_prompt(question: str, history: list[dict[str, str]]) -> str:
