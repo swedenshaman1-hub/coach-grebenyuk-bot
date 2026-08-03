@@ -1,0 +1,17 @@
+{
+  "collections": {
+    "grebenyuk": {
+      "title": "Методология Михаила Гребенюка",
+      "mode": "strict",
+      "notebooks": [
+        {
+          "id": "grebenyuk_main",
+          "uuid": "85da7d6e-6980-4da0-89a9-4efabc9542bc",
+          "url": "https://notebook.google.com/notebook/85da7d6e-6980-4da0-89a9-4efabc9542bc",
+          "role": "Основная база методологии",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

@@ -5,3 +5,4 @@ vosk>=0.3.45
 python-dotenv>=1.0.0
 python-telegram-bot>=20.0
 notebooklm-mcp-2026>=0.2.1
+psycopg[binary]>=3.2,<4.0
