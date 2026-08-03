@@ -17,6 +17,7 @@ from strict_contract import (
     ErrorType,
     ResultStatus,
     build_strict_prompt,
+    is_coaching_start,
     parse_and_validate,
     render_verified_answer,
 )
@@ -92,8 +93,7 @@ class StrictKnowledgeService:
         )
 
     @staticmethod
-    def _clarification_text(missing_information: list[str]) -> str:
-        """Turn NotebookLM's missing inputs into a useful coaching continuation."""
+    def _diagnostic_questions(missing_information: list[str]) -> str:
         items: list[str] = []
         for value in missing_information[:5]:
             text = " ".join(str(value).split()).strip(" -•\t")[:240]
@@ -108,7 +108,12 @@ class StrictKnowledgeService:
                 "Какой текущий результат и к какой цели ты хочешь прийти?",
                 "Что ты считаешь главным ограничением роста сейчас?",
             ]
-        questions = "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
+        return "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
+
+    @classmethod
+    def _clarification_text(cls, missing_information: list[str]) -> str:
+        """Turn NotebookLM's missing inputs into a useful coaching continuation."""
+        questions = cls._diagnostic_questions(missing_information)
         return (
             "Давай начнём с короткой диагностики. Ответь, пожалуйста:\n\n"
             f"{questions}\n\nМожно одним сообщением — я соберу ответы и предложу следующий шаг."
@@ -249,6 +254,14 @@ class StrictKnowledgeService:
             raw_answer="\n\n--- NOTEBOOK ---\n\n".join(raw_parts),
         )
         public_answer = render_verified_answer(combined)
+        # A broad invitation to start coaching must always advance the dialogue.
+        # Questions contain no factual claims, so adding them cannot introduce
+        # knowledge outside NotebookLM while preventing a conversational dead end.
+        if is_coaching_start(question) and public_answer.count("?") < 2:
+            public_answer = (
+                f"{public_answer}\n\nЧтобы перейти к разбору твоего бизнеса, ответь:\n\n"
+                f"{self._diagnostic_questions([])}"
+            )
         combined.answer = public_answer
         source_fingerprint = hashlib.sha256(
             "\n".join(fingerprints).encode("utf-8")

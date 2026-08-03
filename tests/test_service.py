@@ -125,6 +125,16 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("короткой диагностики", result.text)
         self.assertIn("Чем занимается бизнес?", result.text)
 
+    def test_verified_coaching_start_always_asks_diagnostic_questions(self):
+        result = self.service.answer(
+            "Давай начнем с развития моего бизнеса",
+            [],
+            10,
+        )
+        self.assertEqual(result.status, ResultStatus.VERIFIED)
+        self.assertGreaterEqual(result.text.count("?"), 4)
+        self.assertIn("главным ограничением роста", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()
