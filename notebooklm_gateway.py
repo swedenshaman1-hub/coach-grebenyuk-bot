@@ -85,9 +85,10 @@ class NotebookLMGateway:
             max(1, int(os.getenv("NOTEBOOKLM_MAX_PARALLEL", "2")))
         )
         self.deadline_seconds = min(
-            # 254-source notebooks regularly need 70-100 seconds.  Never let a
-            # stale Railway value reintroduce the old 85-second false timeout.
-            150, max(110, int(os.getenv("NOTEBOOKLM_REQUEST_DEADLINE", "110")))
+            # Large notebooks regularly need more than two minutes for a strict
+            # evidence-backed answer. Keep a bounded per-attempt timeout, then
+            # retry once on a clean conversation if NotebookLM stalls.
+            180, max(150, int(os.getenv("NOTEBOOKLM_REQUEST_DEADLINE", "150")))
         )
         self.max_attempts = min(
             3, max(1, int(os.getenv("NOTEBOOKLM_MAX_ATTEMPTS", "2")))
@@ -375,6 +376,7 @@ print(json.dumps(result, ensure_ascii=False))
         started = time.monotonic()
         last_error = ""
         last_type = ErrorType.UNKNOWN
+        attempt_conversation_id = conversation_id
         with self._slots:
             sources = self._source_cache.get(notebook_id) or []
             if not sources:
@@ -394,7 +396,7 @@ print(json.dumps(result, ensure_ascii=False))
                 self._source_cache[notebook_id] = sources
             for attempt in range(1, self.max_attempts + 1):
                 result = self._call_once(
-                    notebook_id, query, conversation_id, False, sources
+                    notebook_id, query, attempt_conversation_id, False, sources
                 )
                 response_sources = self._parse_sources(result.get("sources") or [])
                 answer = str(result.get("answer") or "").strip()
@@ -411,12 +413,30 @@ print(json.dumps(result, ensure_ascii=False))
                 last_error = str(result.get("error") or "NotebookLM returned no verified payload")
                 last_type = classify_error(last_error)
                 retryable = last_type in {
+                    ErrorType.TIMEOUT,
                     ErrorType.RATE_LIMIT,
                     ErrorType.SERVER,
                     ErrorType.NETWORK,
                 }
                 if attempt >= self.max_attempts or not retryable:
                     break
+                # A timed-out NotebookLM conversation may remain wedged. The
+                # prompt already contains the last four chat messages, so a
+                # clean conversation preserves context without reusing the
+                # stalled server-side session.
+                if last_type in {
+                    ErrorType.TIMEOUT,
+                    ErrorType.SERVER,
+                    ErrorType.NETWORK,
+                }:
+                    attempt_conversation_id = None
+                logger.warning(
+                    "NotebookLM retry %s/%s after %s (fresh_session=%s)",
+                    attempt + 1,
+                    self.max_attempts,
+                    last_type.value,
+                    attempt_conversation_id is None,
+                )
                 delay = 0.8 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.35)
                 time.sleep(delay)
         return GatewayResponse(

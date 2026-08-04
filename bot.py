@@ -564,13 +564,29 @@ async def _answer_unlocked(update: Update, question: str, force_fresh: bool = Fa
         return
     started_at = time.monotonic()
     await update.message.reply_text("Анализирую вопрос... ⏳")
-    result = await _run_blocking(
-        STRICT_KNOWLEDGE.answer,
-        question,
-        history,
-        chat_id,
-        force_fresh,
+    answer_task = asyncio.create_task(
+        _run_blocking(
+            STRICT_KNOWLEDGE.answer,
+            question,
+            history,
+            chat_id,
+            force_fresh,
+        )
     )
+    try:
+        result = await asyncio.wait_for(asyncio.shield(answer_task), timeout=90.0)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "Источник отвечает медленнее обычного. Продолжаю поиск и проверку — "
+            "повторять вопрос не нужно. ⏳"
+        )
+        try:
+            result = await asyncio.wait_for(asyncio.shield(answer_task), timeout=85.0)
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                "Первый запрос задержался. Выполняю автоматическую резервную попытку... 🔄"
+            )
+            result = await answer_task
     _nb_last_error_type = result.error_type
 
     if result.status is ResultStatus.VERIFIED:
